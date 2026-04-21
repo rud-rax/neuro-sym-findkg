@@ -7,6 +7,8 @@
 
 import os
 import sys
+import json
+import argparse
 import pprint
 
 import pandas as pd
@@ -57,24 +59,32 @@ from DKG.utils.neuro_symbolic_eval import NeuroSymbolicEvaluator
 INTER_EVENT_TIME_DTYPE = torch.float32
 
 
-############################### Config ############################### 
-graph_mode = "FinDKG"   # specify the dataset: "FinDKG" "ICEWS18"  #"ICEWS14"  #"ICEWS_500"  #"GDELT"  #"WIKI"  #"YAGO"
+############################### Config ###############################
+def _load_config(path):
+    with open(path) as f:
+        return json.load(f)
 
-model_ver = "KGTransformer"   # Mode name: "GraphTransformer"
-model_type ='KGT+RNN'  # 'KGT+RNN' for GraphTransformer | 'RGCN+RNN' for GraphRNN
-epoch_times = 150
-random_seed = 41
-data_root_path = './data'   # output data path
+_parser = argparse.ArgumentParser()
+_parser.add_argument('--config', type=str, default='config/v1.json',
+                     help='Path to JSON config file')
+_cli_args = _parser.parse_args()
+cfg = _load_config(_cli_args.config)
 
-flag_train = True    # Traing the model
-flag_eval = True     # Evaluate the model
+graph_mode              = cfg.get("graph_mode", "FinDKG")
+model_ver               = cfg.get("model_ver", "KGTransformer")
+model_type              = cfg.get("model_type", "KGT+RNN")
+epoch_times             = cfg.get("epoch_times", 150)
+random_seed             = cfg.get("random_seed", 41)
+data_root_path          = cfg.get("data_root_path", "./data")
 
-# ============= Neuro-Symbolic Configuration (Approach 1: Post-Processing) =============
-use_neuro_symbolic = True           # Enable/disable neuro-symbolic post-processing
-neural_weight = 0.7                 # Weight for neural scores [0, 1]
-symbolic_weight = 0.3               # Weight for symbolic scores [0, 1]
-use_financial_rules = True          # Use pre-configured financial domain rules
-neuro_symbolic_boost_factor = 0.3   # How much to boost valid predictions
+flag_train              = cfg.get("flag_train", True)
+flag_eval               = cfg.get("flag_eval", True)
+
+use_neuro_symbolic          = cfg.get("use_neuro_symbolic", False)
+neural_weight               = cfg.get("neural_weight", 0.7)
+symbolic_weight             = cfg.get("symbolic_weight", 0.3)
+use_financial_rules         = cfg.get("use_financial_rules", True)
+neuro_symbolic_boost_factor = cfg.get("neuro_symbolic_boost_factor", 0.3)
 
 
 ############################### Load Graph Data ###############################
