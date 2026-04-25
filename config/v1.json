@@ -1,0 +1,15 @@
+{
+  "graph_mode": "FinDKG",
+  "model_ver": "Vanilla_1_KGTransformer",
+  "model_type": "KGT+RNN",
+  "epoch_times": 150,
+  "random_seed": 41,
+  "data_root_path": "./data",
+  "flag_train": true,
+  "flag_eval": true,
+  "use_neuro_symbolic": false,
+  "neural_weight": 0.7,
+  "symbolic_weight": 0.3,
+  "use_financial_rules": true,
+  "neuro_symbolic_boost_factor": 0.3
+}

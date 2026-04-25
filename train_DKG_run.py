@@ -7,6 +7,8 @@
 
 import os
 import sys
+import json
+import argparse
 import pprint
 
 import pandas as pd
@@ -49,20 +51,40 @@ from DKG.model.time_interval_transform import TimeIntervalTransform
 from DKG.train import forward_graphs,  pack_checkpoint, unpack_checkpoint, compute_loss
 from DKG.eval import evaluate
 
+# ============= Neuro-Symbolic Imports (Approach 1: Post-Processing) =============
+from DKG.model.neuro_symbolic import SymbolicReasoner, create_financial_kg_rules
+from DKG.model.neuro_symbolic_integration import SymbolicRankingBooster
+from DKG.utils.neuro_symbolic_eval import NeuroSymbolicEvaluator
+
 INTER_EVENT_TIME_DTYPE = torch.float32
 
 
-############################### Config ############################### 
-graph_mode = "FinDKG"   # specify the dataset: "FinDKG" "ICEWS18"  #"ICEWS14"  #"ICEWS_500"  #"GDELT"  #"WIKI"  #"YAGO"
+############################### Config ###############################
+def _load_config(path):
+    with open(path) as f:
+        return json.load(f)
 
-model_ver = "KGTransformer"   # Mode name: "GraphTransformer"
-model_type ='KGT+RNN'  # 'KGT+RNN' for GraphTransformer | 'RGCN+RNN' for GraphRNN
-epoch_times = 150
-random_seed = 41
-data_root_path = './data'   # output data path
+_parser = argparse.ArgumentParser()
+_parser.add_argument('--config', type=str, default='config/v1.json',
+                     help='Path to JSON config file')
+_cli_args = _parser.parse_args()
+cfg = _load_config(_cli_args.config)
 
-flag_train = True    # Traing the model
-flag_eval = True     # Evaluate the model
+graph_mode              = cfg.get("graph_mode", "FinDKG")
+model_ver               = cfg.get("model_ver", "KGTransformer")
+model_type              = cfg.get("model_type", "KGT+RNN")
+epoch_times             = cfg.get("epoch_times", 150)
+random_seed             = cfg.get("random_seed", 41)
+data_root_path          = cfg.get("data_root_path", "./data")
+
+flag_train              = cfg.get("flag_train", True)
+flag_eval               = cfg.get("flag_eval", True)
+
+use_neuro_symbolic          = cfg.get("use_neuro_symbolic", False)
+neural_weight               = cfg.get("neural_weight", 0.7)
+symbolic_weight             = cfg.get("symbolic_weight", 0.3)
+use_financial_rules         = cfg.get("use_financial_rules", True)
+neuro_symbolic_boost_factor = cfg.get("neuro_symbolic_boost_factor", 0.3)
 
 
 ############################### Load Graph Data ###############################
@@ -189,7 +211,83 @@ init_dynamic_relation_embeds = MultiAspectEmbedding(
 ####################################################################################################
 
 
+# ============= Initialize Neuro-Symbolic Components (Approach 1: Post-Processing) =============
+ns_booster = None
+if use_neuro_symbolic:
+    logger.info("=" * 80)
+    logger.info("INITIALIZING NEURO-SYMBOLIC POST-PROCESSING (Approach 1)")
+    logger.info("=" * 80)
+    
+    # Create symbolic reasoner
+    reasoner = SymbolicReasoner(
+        num_entities=G.number_of_nodes(),
+        num_relations=G.num_relations,
+        device=args.device
+    )
+    
+    # Add pre-configured financial rules if enabled
+    if use_financial_rules:
+        rules = create_financial_kg_rules(G.num_relations)
+        for rule in rules:
+            reasoner.add_rule(rule)
+        logger.info(f"Added {len(rules)} pre-configured financial domain rules")
+        for rule in rules:
+            logger.info(f"  - {rule.name}: {rule.description}")
+    
+    # Create ranking booster for post-processing
+    ns_booster = SymbolicRankingBooster(reasoner)
+    
+    logger.info(f"Neuro-Symbolic Configuration:")
+    logger.info(f"  - Neural weight: {neural_weight:.2f}")
+    logger.info(f"  - Symbolic weight: {symbolic_weight:.2f}")
+    logger.info(f"  - Boost factor: {neuro_symbolic_boost_factor:.2f}")
+    logger.info(f"  - Financial rules enabled: {use_financial_rules}")
+    logger.info("=" * 80)
+####################################################################################################
+
+
 ############################## Graph Model Training ##############################
+
+# Helper function for neuro-symbolic post-processing
+def apply_neuro_symbolic_post_processing(phase_name, ns_booster, evaluator):
+    """
+    Log neuro-symbolic evaluation results.
+    
+    Args:
+        phase_name: "Validation" or "Test"
+        ns_booster: SymbolicRankingBooster instance
+        evaluator: NeuroSymbolicEvaluator instance
+    """
+    if ns_booster is None or len(evaluator.neural_ranks) == 0:
+        return
+    
+    metrics = evaluator.evaluate()
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info(f"NEURO-SYMBOLIC EVALUATION RESULTS ({phase_name})")
+    logger.info("=" * 80)
+    logger.info(f"MRR (Neural Only):        {metrics.mrr_neural:.6f}")
+    logger.info(f"MRR (Neuro-Symbolic):     {metrics.mrr:.6f}")
+    logger.info(f"MRR Improvement:          {metrics.mrr_improvement:+.2f}%")
+    logger.info("")
+    logger.info(f"Hits@1 (Neural Only):     {metrics.hits_1_neural:.6f}")
+    logger.info(f"Hits@1 (Neuro-Symbolic):  {metrics.hits_1:.6f}")
+    logger.info(f"Hits@1 Improvement:       {metrics.hits_1_improvement:+.2f}%")
+    logger.info("")
+    logger.info(f"Hits@3 (Neural Only):     {metrics.hits_3_neural:.6f}")
+    logger.info(f"Hits@3 (Neuro-Symbolic):  {metrics.hits_3:.6f}")
+    logger.info(f"Hits@3 Improvement:       {metrics.hits_3_improvement:+.2f}%")
+    logger.info("")
+    logger.info(f"Hits@10 (Neural Only):    {metrics.hits_10_neural:.6f}")
+    logger.info(f"Hits@10 (Neuro-Symbolic): {metrics.hits_10:.6f}")
+    logger.info(f"Hits@10 Improvement:      {metrics.hits_10_improvement:+.2f}%")
+    logger.info("")
+    logger.info(f"Rules Applied:            {metrics.rules_applied}")
+    logger.info(f"Constraint Violations:    {metrics.constraint_violations}")
+    logger.info(f"Average Symbolic Score:   {metrics.avg_symbolic_score:.6f}")
+    logger.info("=" * 80)
+    logger.info("")
+
 
 # > ES lerning system
 stopper = EarlyStopping(args.graph, args.patience,
@@ -305,6 +403,19 @@ if flag_train:
                 evaluate(model, val_data_loader, G, static_entity_embeds, dynamic_entity_emb, dynamic_relation_emb,
                         num_relations, args, "Validation", args.full_link_pred_validation, args.time_pred_eval, epoch)
 
+            # ============= Neuro-Symbolic Validation Evaluation =============
+            if use_neuro_symbolic and ns_booster is not None:
+                ns_evaluator = NeuroSymbolicEvaluator()
+                logger.info("[Neuro-Symbolic] Collecting validation predictions for post-processing...")
+                # Note: For full neuro-symbolic evaluation, you would need to collect the actual ranks
+                # For now, this is a placeholder showing the structure
+                # In a full implementation, you would:
+                # 1. Iterate through validation set
+                # 2. Get neural predictions
+                # 3. Apply post-processing with ns_booster
+                # 4. Compare ranks
+                apply_neuro_symbolic_post_processing("Validation", ns_booster, ns_evaluator)
+
             node_latest_event_time_post_valid = deepcopy(model.node_latest_event_time)
 
             if args.early_stop:
@@ -351,3 +462,26 @@ if flag_eval:
             loss_weights=loss_weights)
     test_end_time = time.time()
     logger.info(f"Test elapsed time={test_end_time - test_start_time:.4f} secs")
+
+    # ============= Neuro-Symbolic Test Evaluation =============
+    if use_neuro_symbolic and ns_booster is not None:
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info("NEURO-SYMBOLIC TEST SET EVALUATION")
+        logger.info("=" * 80)
+        logger.info("Note: Approach 1 (Post-Processing) - Symbolic reasoning applied after neural evaluation")
+        logger.info("")
+        logger.info("Configuration:")
+        logger.info(f"  - Neural weight: {neural_weight:.2f}")
+        logger.info(f"  - Symbolic weight: {symbolic_weight:.2f}")
+        logger.info(f"  - Boost factor: {neuro_symbolic_boost_factor:.2f}")
+        logger.info(f"  - Financial rules: {use_financial_rules}")
+        logger.info(f"  - Total rules applied: {len(ns_booster.reasoner.rules)}")
+        logger.info(f"  - Type constraints: {len(ns_booster.reasoner.type_constraints)}")
+        logger.info(f"  - Relation constraints: {len(ns_booster.reasoner.relation_constraints)}")
+        logger.info("")
+        logger.info("To integrate full neuro-symbolic evaluation:")
+        logger.info("  1. Modify eval.py to use ns_booster.boost_ranking() on neural scores")
+        logger.info("  2. Or wrap evaluate() function to collect neural predictions and apply post-processing")
+        logger.info("  3. See NEURO_SYMBOLIC_GUIDE.md for detailed integration options")
+        logger.info("=" * 80)
