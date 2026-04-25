@@ -187,14 +187,17 @@ def generate_neural_candidates(
     device, top_k,
 ):
     """
-    For each gold quadruple (s, r, o, t) in the target split, score all entities
-    for query (s, r, ?, t) and collect the top-k as candidate quadruples.
+    For each unique (s, r, t) query in the target split, score all entities and
+    collect the top-k objects as candidate quadruples (s, r, o_hat, t).
 
     Returns a set of (head_id, rel_id, tail_id, time) integer tuples.
 
-    Temporal leakage is avoided because:
-    - Embeddings start from the pre-split state (train-end for valid, post-valid for test).
-    - For each timestamp batch, predictions are made BEFORE updating embeddings with that batch.
+    Key design choices:
+    - Query deduplication (Option 1): multiple gold edges sharing the same (s, r, t)
+      are processed with a single forward pass, eliminating redundant computation
+      and repeated rows in the output.
+    - Leakage-free: embeddings start from the pre-split state and are updated AFTER
+      predictions are made for each timestamp batch.
     """
     model.eval()
     dynamic_entity_emb = init_entity_emb
@@ -207,8 +210,7 @@ def generate_neural_candidates(
             eval_time_from = batch_times[0]
             eval_time_to = batch_times[-1]
 
-            # Move cumul_G to device first so eval_eid is on the same device
-            # (EdgeModel.forward indexes edge_head/tail with eid, requiring same device)
+            # Move cumul_G to device so eval_eid is on the same device as edge tensors
             cumul_G_dev = cumul_G.to(device)
 
             eval_eid = torch.nonzero(
@@ -218,52 +220,63 @@ def generate_neural_candidates(
             ).squeeze().view(-1)
 
             if len(eval_eid) > 0:
-                # Gather embeddings for nodes present in cumul_G
+                # ── Shared embeddings for this batch ──────────────────────────
                 cumul_nids = cumul_G_dev.ndata[dgl.NID].long()
-
                 struct_static = static_emb.structural[cumul_nids].to(device)
                 struct_dynamic = dynamic_entity_emb.structural[cumul_nids][:, -1, :].to(device)
                 combined_emb = model.combiner(struct_static, struct_dynamic, cumul_G_dev)
                 rel_emb = dynamic_relation_emb.structural[:, -1, :, :].to(device)
-
                 cumul_G_dev.ndata["emb"] = combined_emb
 
-                # edge_model returns (edge_LL, head_pred, rel_pred, tail_pred)
-                # tail_pred shape: (len(eval_eid), num_all_entities) — global entity space
+                # ── Recover (s_global, r, t) for every eval edge (on CPU) ────
+                eval_eid_cpu = eval_eid.cpu()
+                cumul_src, _ = cumul_G.edges()
+                eval_src_local  = cumul_src[eval_eid_cpu.long()]
+                eval_src_global = cumul_G.ndata[dgl.NID][eval_src_local].long()  # global entity IDs
+                eval_rel        = cumul_G.edata["rel_type"][eval_eid_cpu].long()
+                eval_time       = cumul_G.edata["time"][eval_eid_cpu]
+
+                # ── Query deduplication: group edge indices by unique (s, r, t) ──
+                # Edges sharing the same query produce identical scores — score each once.
+                seen_queries = {}   # (s, r, t) -> position in unique_eids list
+                unique_eids = []    # one representative eid per unique query
+                query_map   = []    # for each eval edge: index into unique_eids
+
+                for i, (s, r, t) in enumerate(zip(
+                    eval_src_global.tolist(),
+                    eval_rel.tolist(),
+                    eval_time.tolist(),
+                )):
+                    key = (int(s), int(r), int(t))
+                    if key not in seen_queries:
+                        seen_queries[key] = len(unique_eids)
+                        unique_eids.append(eval_eid[i])   # device tensor element
+                    query_map.append(seen_queries[key])
+
+                unique_eid_tensor = torch.stack(unique_eids)   # (num_unique,) on device
+
+                # ── Single forward pass over unique queries ───────────────────
                 _, _, _, tail_pred = model.edge_model(
                     cumul_G_dev,
                     combined_emb,
                     struct_static,
                     struct_dynamic,
                     rel_emb,
-                    eid=eval_eid,
+                    eid=unique_eid_tensor,
                     return_pred=True,
                 )
+                # tail_pred: (num_unique, num_all_entities) — scores in global entity space
 
-                # top-k entity indices are already in global entity ID space
                 actual_k = min(top_k, tail_pred.size(1))
-                top_k_ids = torch.topk(tail_pred, actual_k, dim=1).indices.cpu()  # (eval_edges, k)
+                top_k_ids = torch.topk(tail_pred, actual_k, dim=1).indices.cpu()  # (num_unique, k)
 
-                # Recover global src IDs, relation types, timestamps using CPU tensors
-                eval_eid_cpu = eval_eid.cpu()
-                cumul_src, _ = cumul_G.edges()
-                eval_src_local = cumul_src[eval_eid_cpu.long()]
-                eval_src_global = cumul_G.ndata[dgl.NID][eval_src_local].long()
-                eval_rel = cumul_G.edata["rel_type"][eval_eid_cpu].long()
-                eval_time = cumul_G.edata["time"][eval_eid_cpu]
+                # ── Add candidate quadruples using deduplicated queries ────────
+                for (s, r, t), uid in seen_queries.items():
+                    for o_hat in top_k_ids[uid].tolist():
+                        neu_triplets.add((s, r, int(o_hat), int(t)))
 
-                for s, r, t, candidates in zip(
-                    eval_src_global.tolist(),
-                    eval_rel.tolist(),
-                    eval_time.tolist(),
-                    top_k_ids.tolist(),
-                ):
-                    t_int = int(t)
-                    for o_hat in candidates:
-                        neu_triplets.add((int(s), int(r), int(o_hat), t_int))
-
-            # Update embeddings AFTER making predictions for this batch (no leakage).
-            # Pass CPU cumul_G — embedding_updater asserts embeddings are on CPU.
+            # Update embeddings AFTER predictions — no leakage into next batch.
+            # Pass CPU cumul_G; embedding_updater requires CPU embeddings.
             dynamic_entity_emb, dynamic_relation_emb = model.embedding_updater.forward(
                 prior_G, batch_G, cumul_G, static_emb,
                 dynamic_entity_emb, dynamic_relation_emb, device,
@@ -277,9 +290,14 @@ def generate_neural_candidates(
 # ---------------------------------------------------------------------------
 
 def load_symbolic_predictions(path):
-    """Load symbolic predictions from TSV: head_id<TAB>rel_id<TAB>tail_id<TAB>time."""
-    df = pd.read_table(path, sep="\t", header=None, names=["head", "rel", "tail", "time"])
-    return {(int(r.head), int(r.rel), int(r.tail), int(r.time)) for r in df.itertuples(index=False)}
+    """Load symbolic predictions from TSV: head_id<TAB>rel_id<TAB>tail_id (no time column).
+
+    Symbolic predictions are time-agnostic (s, r, o) triples — the symbolic model
+    predicts future relationships without committing to a specific timestamp.
+    Coverage against gold is checked by matching (s, r, o) only.
+    """
+    df = pd.read_table(path, sep="\t", header=None, names=["head", "rel", "tail"])
+    return {(int(r.head), int(r.rel), int(r.tail)) for r in df.itertuples(index=False)}
 
 
 def extract_gold_quads(G, split):
@@ -316,22 +334,42 @@ def load_id2relation(data_dir, dataset):
 # ---------------------------------------------------------------------------
 
 def compute_coverage(gold, sym, neu):
+    """Compute coverage metrics with asymmetric matching.
+
+    - sym is a set of (s, r, o) triples  — time-agnostic (symbolic model output)
+    - neu is a set of (s, r, o, t) quads — time-aware   (neural model output)
+    - gold is a set of (s, r, o, t) quads from the evaluation split
+
+    A gold fact (s, r, o, t) is covered by sym if (s, r, o) ∈ sym (any timestamp).
+    A gold fact (s, r, o, t) is covered by neu if (s, r, o, t) ∈ neu (exact match).
+    Union coverage: either condition is true.
+    """
     n = len(gold)
     if n == 0:
         return {"error": "gold set is empty"}
-    sym_hit = gold & sym
-    neu_hit = gold & neu
-    union_hit = gold & (sym | neu)
+
+    # Project gold to (s, r, o) for sym comparison
+    gold_triples = {(s, r, o) for s, r, o, t in gold}
+
+    sym_hit_triples = gold_triples & sym          # (s,r,o) hits
+    neu_hit_quads   = gold & neu                  # (s,r,o,t) exact hits
+
+    # Union: a gold fact is covered if its (s,r,o) is in sym OR its (s,r,o,t) is in neu
+    union_hit = sum(
+        1 for s, r, o, t in gold
+        if (s, r, o) in sym or (s, r, o, t) in neu
+    )
+
     return {
         "num_gold": n,
         "sym_count": len(sym),
         "neu_count": len(neu),
-        "sym_hit": len(sym_hit),
-        "neu_hit": len(neu_hit),
-        "union_hit": len(union_hit),
-        "sym_coverage": len(sym_hit) / n,
-        "neu_coverage": len(neu_hit) / n,
-        "union_coverage": len(union_hit) / n,
+        "sym_hit": len(sym_hit_triples),
+        "neu_hit": len(neu_hit_quads),
+        "union_hit": union_hit,
+        "sym_coverage": len(sym_hit_triples) / n,
+        "neu_coverage": len(neu_hit_quads) / n,
+        "union_coverage": union_hit / n,
     }
 
 
