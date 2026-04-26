@@ -1,0 +1,857 @@
+
+================================================================================
+              FinDKG SYMBOLIC REASONING ARCHITECTURE
+              Ruleformer + Neuro-Symbolic Integration Pipeline
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ OVERVIEW: THREE-PHASE PIPELINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Phase 1: RULE LEARNING       — Ruleformer transformer learns logical rules
+                                  from KG triples in train.txt
+                                  Files: ruleformer-findkg/translate.py
+                                         ruleformer-findkg/transformer/
+
+  Phase 2: RULE APPLICATION    — Learned rules applied via forward chaining
+                                  to generate new symbolic triples
+                                  Files: DKG/symbolic/apply_rules.py
+                                         DKG/symbolic/ruleformer_adapter.py
+
+  Phase 3: NEURO-SYMBOLIC      — Symbolic scores fused with neural scores
+           SCORING               at inference time
+                                  Files: DKG/model/neuro_symbolic.py
+                                         DKG/model/neuro_symbolic_integration.py
+                                         DKG/utils/neuro_symbolic_eval.py
+
+  ┌────────────┐    ┌───────────────┐    ┌────────────────┐    ┌──────────┐
+  │  train.txt │───>│  Ruleformer   │───>│  Rule          │───>│  Neuro-  │
+  │  valid.txt │    │  Transformer  │    │  Application   │    │  Symbol. │
+  │  test.txt  │    │  (Rule Learn) │    │  (Fwd. Chain)  │    │  Scoring │
+  └────────────┘    └───────────────┘    └────────────────┘    └──────────┘
+                           │                     │                    │
+                      rules.txt           sym_triplets.tsv       MRR / Hits@K
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ PHASE 1 — RULE LEARNING (Ruleformer)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  STEP 1.1 — DATA LOADING  [ruleformer-findkg/transformer/dataset.py]
+  ─────────────────────────────────────────────────────────────────────
+
+  FinDKG_dataset/FinDKG/train.txt
+  (format: head_id  rel_id  tail_id  time  _)
+       │
+       │  ruleformer_adapter.py converts to Ruleformer format:
+       │  entities.txt   — one entity name per line (ordered by ID)
+       │  relations.txt  — one relation name per line
+       │  train.txt      — head_name TAB rel_name TAB tail_name
+       │
+       ▼
+  DataBase class
+  ├── Loads entity2id, relation2id mappings
+  ├── Builds sparse adjacency: sparse_matrix[rel_id] = (head, tail) COO
+  │   shape: [num_entities, num_entities] per relation
+  └── Builds neighbor dict: neighbors[entity] = {rel: [tail_entities]}
+
+  STEP 1.2 — SUBGRAPH EXTRACTION  [dataset.pickleDataset]
+  ─────────────────────────────────────────────────────────────────────
+
+  For each training triple (head_entity, head_relation, tail_entity):
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  extract_without_token(head, relation, tail, jump, padding, maxN)        │
+  │                                                                          │
+  │  subgraph = [head_entity]          # hop 0 seed                         │
+  │  relations = []                    # list of (pos_i, pos_j, rel_id)     │
+  │  length = []                       # boundary index per hop              │
+  │                                                                          │
+  │  for hop in range(jump):                                                 │
+  │    for parent in subgraph[prev_level_start : prev_level_end]:            │
+  │      for rel_id in neighbors[parent]:                                    │
+  │        for tail in neighbors[parent][rel_id][:maxN]:  # cap at maxN     │
+  │          if tail not in seen:                                            │
+  │            subgraph.append(tail)                                         │
+  │          relations.append((pos_parent, pos_tail, rel_id))               │
+  │    length.append(len(subgraph))    # boundary for this hop              │
+  │                                                                          │
+  │  Reverse: repeat with tail as seed (for symmetric rule discovery)       │
+  │                                                                          │
+  │  Pad subgraph to PADDING entities (fill with 0s)                        │
+  │  Build 3D relation tensor: [PADDING, PADDING, N_RELATIONS]              │
+  │                                                                          │
+  │  Output:                                                                 │
+  │    subgraph   — list of entity IDs, padded to PADDING                   │
+  │    relations  — tensor [PADDING, PADDING, N_RELATIONS]                  │
+  │    length     — hop boundary indices                                     │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  STEP 1.3 — BATCHING  [dataset.pickleDataset.collate_fn]
+  ─────────────────────────────────────────────────────────────────────
+
+  For a batch of triples:
+    Create forward (h → t) AND reverse (t → h) subgraph pairs
+    Stack into: [2 × batch_size, PADDING, PADDING, N_RELATIONS]
+    batch_lengths: [2 × batch_size, jump]
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ PHASE 1 — RULEFORMER TRANSFORMER ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  [ruleformer-findkg/transformer/Models.py, SubLayers.py, Layers.py]
+
+  Input: subgraph (entity IDs), relations (link matrix), length (hop bounds)
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                             ENCODER                                      │
+  │                   "Read the neighborhood subgraph"                       │
+  ├──────────────────────────────────────────────────────────────────────────┤
+  │                                                                          │
+  │  1. Entity Embedding Lookup                                              │
+  │     E = entityE[ subgraph ]                                              │
+  │     shape: (batch, PADDING, d_model)                                     │
+  │                                                                          │
+  │  2. Neighbor Relation Context                                            │
+  │     nebor_relation: [n_entities, n_relations]                            │
+  │       — log-normalized count of how often each relation appears          │
+  │         for each entity across the entire training set                   │
+  │     relation_type_E: [n_relations, d_model]  — learned relation embeds  │
+  │                                                                          │
+  │     E = ( E + matmul(nebor_relation[subgraph], relation_type_E) ) / 2   │
+  │       — enriches entity representations with relational context          │
+  │                                                                          │
+  │  3. Hop-Aware Positional Encoding                                        │
+  │     Standard PE: position resets at each hop boundary (length param)    │
+  │     — Entities in hop-1 get positions 0..k1                             │
+  │     — Entities in hop-2 get positions 0..k2 (reset, not continued)      │
+  │     — Distinguishes multi-hop structure within a single sequence         │
+  │     E = E + PositionalEncoding(positions, length)                        │
+  │                                                                          │
+  │  4. Dropout + LayerNorm                                                  │
+  │                                                                          │
+  │  5. Encoder Stack  (repeated n_layers times)                             │
+  │  ┌────────────────────────────────────────────────────────────────────┐  │
+  │  │  EncoderLayer:                                                     │  │
+  │  │                                                                    │  │
+  │  │  a) CUSTOM Multi-Head Attention  [SubLayers.py lines 70-86]       │  │
+  │  │     ─────────────────────────────────────────────────────         │  │
+  │  │     Standard MHA:  Attn = softmax( Q·Kᵀ / √d_k ) · V            │  │
+  │  │                                                                    │  │
+  │  │     Ruleformer MHA (relation-aware):                              │  │
+  │  │       Xq = X · Wq          (entity query)                        │  │
+  │  │       Xk = X · Wk          (entity key)                          │  │
+  │  │       Rk = (link · relE) · Wr   (relation key from link matrix)  │  │
+  │  │       Attn = softmax( Xq · (Xk + Rk)ᵀ / √d_k ) · V            │  │
+  │  │                                                                    │  │
+  │  │     link = relations tensor [PADDING, PADDING, N_REL]            │  │
+  │  │       — encodes which relations connect which entity positions     │  │
+  │  │     relE = relation_type_E [N_REL, d_model]                      │  │
+  │  │       — relation embeddings projected into key space              │  │
+  │  │                                                                    │  │
+  │  │     This lets attention be guided by the actual edges (relations) │  │
+  │  │     between entities in the subgraph, not just entity similarity  │  │
+  │  │                                                                    │  │
+  │  │  b) Position-wise Feed Forward                                    │  │
+  │  │     Linear(d_model → d_inner) → ReLU → Linear(d_inner → d_model) │  │
+  │  │                                                                    │  │
+  │  │  c) Residual connections + LayerNorm (after each sub-layer)      │  │
+  │  └────────────────────────────────────────────────────────────────────┘  │
+  │                                                                          │
+  │  Output: encoder_out  shape: (batch, PADDING, d_model)                  │
+  └──────────────────────────────────────────────────────────────────────────┘
+                                  │
+                encoder_out ──────┤
+                                  │
+  ┌───────────────────────────────▼──────────────────────────────────────────┐
+  │                             DECODER                                      │
+  │                   "Predict which relations form the rule"                │
+  ├──────────────────────────────────────────────────────────────────────────┤
+  │                                                                          │
+  │  Input: target_relations  (the rule body to decode, autoregressive)     │
+  │  Sequence: [ <SOS>, rel_1, rel_2, ..., rel_k ]                          │
+  │                                                                          │
+  │  1. Relation Embedding Lookup                                            │
+  │     D = relationE[ target_relations ]                                    │
+  │     shape: (batch, seq_len, d_model)                                     │
+  │                                                                          │
+  │  2. Positional Encoding                                                  │
+  │     D = D + PositionalEncoding(positions)                                │
+  │                                                                          │
+  │  3. Decoder Stack  (repeated n_layers times)                             │
+  │  ┌────────────────────────────────────────────────────────────────────┐  │
+  │  │  DecoderLayer:                                                     │  │
+  │  │                                                                    │  │
+  │  │  a) Masked Self-Attention (causal)                                │  │
+  │  │     — Can only attend to previous positions in the rule body      │  │
+  │  │     — Prevents looking at future relations (autoregressive)       │  │
+  │  │     Residual + LayerNorm                                          │  │
+  │  │                                                                    │  │
+  │  │  b) Cross-Attention (encoder → decoder)                          │  │
+  │  │     — Query: decoder hidden state (what we're predicting)        │  │
+  │  │     — Key/Value: encoder_out (subgraph representation)           │  │
+  │  │     — Links subgraph structure to rule prediction                │  │
+  │  │     Residual + LayerNorm                                          │  │
+  │  │                                                                    │  │
+  │  │  c) Position-wise Feed Forward                                    │  │
+  │  │     Linear(d_model → d_inner) → ReLU → Linear(d_inner → d_model) │  │
+  │  │     Residual + LayerNorm                                          │  │
+  │  └────────────────────────────────────────────────────────────────────┘  │
+  │                                                                          │
+  │  4. Output Projection                                                    │
+  │     seq_logit = Linear(d_model → N_RELATIONS)(decoder_out)              │
+  │     shape: (batch, seq_len, N_RELATIONS)                                 │
+  │                                                                          │
+  │     softmax → relation_attention                                         │
+  │     shape: (batch, seq_len, N_RELATIONS)                                 │
+  │     — at each decoding position: probability distribution over relations │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  Rule Encoding in Decoder:
+  ─────────────────────────────────────────────────────────────────────
+  For rule:  head_rel  ←  rel_1  ^  rel_2  ^  rel_3
+
+    Decoder input (during training):   [ <SOS>, head_rel, rel_1, rel_2 ]
+    Decoder target (what to predict):  [ head_rel, rel_1, rel_2, rel_3 ]
+
+    At position 0: predict head_rel  (from <SOS>)
+    At position 1: predict rel_1     (from <SOS>, head_rel)
+    At position 2: predict rel_2     (from <SOS>, head_rel, rel_1)
+    At position 3: predict rel_3     (from <SOS>, head_rel, rel_1, rel_2)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ PHASE 1 — TRAINING LOOP  [ruleformer-findkg/translate.py]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  optimizer = Adam(betas=(0.9, 0.98), eps=1e-9)                          │
+  │  scheduler = Warmup + InvSqrt decay                                     │
+  │    lr = lr_mul × (d_model^-0.5) × min(step^-0.5, step × warmup^-1.5)  │
+  │    n_warmup_steps = 400                                                  │
+  │                                                                          │
+  │  for epoch in range(n_epoch):                                            │
+  │    for batch in DataLoader(train triples, batch_size):                  │
+  │                                                                          │
+  │      subgraph, link_matrix, lengths = collate_fn(batch)                 │
+  │      target_seq = [<SOS>, rel_1, rel_2, ..., rel_k]                     │
+  │                                                                          │
+  │      logits = model(subgraph, link_matrix, lengths, target_seq)         │
+  │      # shape: (batch, seq_len, N_RELATIONS)                              │
+  │                                                                          │
+  │      loss = CrossEntropyLoss(logits.view(-1, N_RELATIONS),               │
+  │                               target.view(-1))                           │
+  │      + optional label smoothing                                          │
+  │                                                                          │
+  │      loss.backward()                                                     │
+  │      optimizer.step()                                                    │
+  │      scheduler.step()                                                    │
+  │                                                                          │
+  │  Save checkpoint: model.ckpt                                             │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ PHASE 1 — RULE EXTRACTION  [transformer/Translator.py — decode_rule()]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  After training, run inference on all triples to extract rules.
+
+  Input:  trained model, all (head, rel, tail) triples from train.txt
+  Output: rules.txt
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  PROBABILISTIC PATH ENUMERATION (beam-like search)                       │
+  │                                                                          │
+  │  For each training triple (h, r, t):                                    │
+  │                                                                          │
+  │    Run model → relation_attention                                        │
+  │    shape: (seq_len, N_RELATIONS)                                         │
+  │    = softmax probabilities over relations at each decoding step          │
+  │                                                                          │
+  │    Initialize paths at hop 0:                                            │
+  │    paths[0] = [ ( rels=[-1], entities=[h], weight=1.0 ) ]               │
+  │                       │                                                  │
+  │    For step in 0 .. jump-1:                                             │
+  │      attention_at_step = relation_attention[step]  [N_RELATIONS]        │
+  │                                                                          │
+  │      For (rels, entities, weight) in paths[step]:                       │
+  │        current_entity = entities[-1]                                     │
+  │        valid_rels = neighbors[current_entity].keys() + [<self_loop>]    │
+  │                                                                          │
+  │        attention_at_step[invalid_rels] = 0.0   # mask impossible edges  │
+  │                                                                          │
+  │        max_att = max(attention_at_step)                                  │
+  │        attention_at_step /= max_att             # normalize             │
+  │                                                                          │
+  │        TWO-THRESHOLD FILTERING:                                          │
+  │        ┌─────────────────────────────────────────────────────────────┐  │
+  │        │  threshold = max(the_rel,  the_rel_min / max_att)           │  │
+  │        │                                                               │  │
+  │        │  the_rel     = 0.6  (relative: ≥ 60% of max attention)      │  │
+  │        │  the_rel_min = 0.3  (absolute: ≥ 30% / normalized max)      │  │
+  │        │                                                               │  │
+  │        │  Only keep relations where attention > threshold             │  │
+  │        └─────────────────────────────────────────────────────────────┘  │
+  │                                                                          │
+  │        For each surviving relation rel_i:                               │
+  │          new_weight = weight × attention[rel_i]                          │
+  │                                                                          │
+  │          If rel_i == <self_loop>:                                        │
+  │            paths[step+1].append(                                         │
+  │              (rels + [<self_loop>], entities + [tail], new_weight))     │
+  │          Else:                                                           │
+  │            For each neighbor t' via rel_i from current_entity:          │
+  │              paths[step+1].append(                                       │
+  │                (rels + [rel_i], entities + [t'], new_weight))           │
+  │                                                                          │
+  │    FINAL FILTER (overall confidence):                                   │
+  │    the_all = 0.1   (entire path weight must be ≥ 10%)                  │
+  │                                                                          │
+  │    For (rels, entities, weight) in paths[final_hop]:                   │
+  │      if weight > the_all:                                               │
+  │        head_rule = id2rel[r]                                            │
+  │        body = "^".join(id2rel[ri] for ri in rels[1:])                  │
+  │        rules[head_rule][body].append(weight)                            │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  RULE AGGREGATION                                                        │
+  │                                                                          │
+  │  For each unique rule:  head_rel  ←  body_rels                          │
+  │    weights = [w1, w2, w3, ...]   (collected across all training triples) │
+  │    count   = len(weights)                                                │
+  │    avg_wt  = sum(weights) / count                                        │
+  │                                                                          │
+  │  Output format in rules.txt:                                             │
+  │    "{count}-{avg_weight}  {head_rel} <- {body_rel_1}^{body_rel_2}..."   │
+  │                                                                          │
+  │  Example:                                                                │
+  │    27-0.623   Control <- Control^Control                                 │
+  │    42-0.581   Impact <- Relate_To^Impact                                 │
+  │    15-0.512   Has <- Operate_In^Has                                      │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+              ┌─────────────────────────────┐
+              │          rules.txt          │
+              │  27-0.623 Control <- ...   │
+              │  42-0.581 Impact  <- ...   │
+              │  15-0.512 Has     <- ...   │
+              │  ...                        │
+              └─────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ PHASE 2 — RULE APPLICATION  [DKG/symbolic/apply_rules.py]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  STEP 2.1 — FORMAT CONVERSION  [DKG/symbolic/ruleformer_adapter.py]
+  ─────────────────────────────────────────────────────────────────────
+
+  FinDKG format:                    Ruleformer format:
+  ┌────────────────────────┐        ┌─────────────────────────────────────┐
+  │ entity2id.txt          │        │ entities.txt                        │
+  │  Donald Trump  0       │──────► │  Donald Trump                       │
+  │  United States 1       │        │  United States                      │
+  │  ...                   │        │  ...                                 │
+  │                        │        ├─────────────────────────────────────┤
+  │ relation2id.txt        │        │ relations.txt                       │
+  │  Relate_To  0          │──────► │  Relate_To                          │
+  │  Control    1          │        │  Control                            │
+  │  ...                   │        │  ...                                 │
+  │                        │        ├─────────────────────────────────────┤
+  │ train.txt              │        │ train.txt (name format)             │
+  │  12  1  6582  0  _     │──────► │  Donald Trump  Control  China       │
+  └────────────────────────┘        └─────────────────────────────────────┘
+
+  STEP 2.2 — PARSE RULES  [apply_rules.parse_rules()]
+  ─────────────────────────────────────────────────────────────────────
+
+  Input: rules.txt
+  Regex: r"^(\d+)-([\d.]+)\s+(\S+)\s*<-\s*(.+)$"
+  Parse: count, weight, head_rel, body_rels
+
+  Filter:
+    weight ≥ min_weight  (e.g., 0.1)
+    count  ≥ min_count   (e.g., 3)
+  Sort: by weight descending
+
+  Output: List of (weight, count, head_rel, [body_rel_1, body_rel_2, ...])
+
+  STEP 2.3 — BUILD KG LOOKUP  [apply_rules.load_kg()]
+  ─────────────────────────────────────────────────────────────────────
+
+  From Ruleformer train.txt (name format):
+
+  hr_t:   dict[ (head_name, rel_name) ]  →  set of tail_names
+  known:  set of (head_name, rel_name, tail_name)
+
+  Example:
+    hr_t[("Apple", "Control")] = {"Tesla", "SolarCity"}
+    hr_t[("Tesla", "Operate_In")] = {"USA", "Germany"}
+    known = {("Apple", "Control", "Tesla"), ...}
+
+  STEP 2.4 — RULE APPLICATION (forward chaining)  [apply_rules._apply_rule()]
+  ─────────────────────────────────────────────────────────────────────
+
+  For rule:  Impact  ←  Relate_To  ^  Impact
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  Algorithm: Sequential frontier expansion                                │
+  │                                                                          │
+  │  1. Find seed entities:                                                  │
+  │     heads = { h : (h, Relate_To, ·) ∈ hr_t }                           │
+  │                                                                          │
+  │  2. Follow body relations one at a time:                                │
+  │     frontier = set(heads)                                                │
+  │     for rel in [Relate_To, Impact]:                                     │
+  │       next_frontier = set()                                              │
+  │       for node in frontier:                                              │
+  │         next_frontier |= hr_t.get((node, rel), set())                   │
+  │       frontier = next_frontier                                           │
+  │                                                                          │
+  │  3. frontier now = { entities reachable from heads via full rule body } │
+  │                                                                          │
+  │  4. Generate predicted triples:                                         │
+  │     for h in heads:                                                      │
+  │       for t in frontier:                                                 │
+  │         if (h, "Impact", t) not in known:                               │
+  │           yield (h, "Impact", t)     ← NEW symbolic triple              │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  Visual example (2-hop rule:  Impact ← Relate_To ^ Impact):
+
+    Apple ──[Relate_To]──► Tesla ──[Impact]──► FederalReserve
+      │                                              │
+      └──────── rule infers: ────────────────────────►
+                Apple  Impact  FederalReserve  (NEW)
+
+  STEP 2.5 — ID MAPPING & OUTPUT  [apply_rules.apply_rules_to_kg()]
+  ─────────────────────────────────────────────────────────────────────
+
+  Collect all predicted triples (still in name format)
+  Deduplicate: predicted = set of (h_name, r_name, t_name)
+
+  Map back to FinDKG IDs:
+    h_id = ent2id[h_name]
+    r_id = rel2id[r_name]
+    t_id = ent2id[t_name]
+    (skip if any name not in mapping)
+
+  Write: sym_triplets.tsv
+    format: h_id TAB r_id TAB t_id
+
+          ┌───────────────────────┐
+          │   sym_triplets.tsv    │
+          │  5     1    47        │
+          │  47    2   123        │
+          │  123   4   456        │
+          │  ...                  │
+          └───────────────────────┘
+  Uses: augment training data or inject into validation scoring
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ PHASE 3 — NEURO-SYMBOLIC SCORING  [DKG/model/neuro_symbolic.py]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  COMPONENT A — SymbolicReasoner
+  ─────────────────────────────────────────────────────────────────────
+
+  Storage:
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  rules:                List[SymbolicRule]                                │
+  │    SymbolicRule fields:                                                  │
+  │      name, description                                                   │
+  │      head_relation:     int                                              │
+  │      body_relations:    List[int]                                        │
+  │      confidence:        float [0, 1]                                     │
+  │      temporal_constraint: str (optional)                                 │
+  │                                                                          │
+  │  type_constraints:     dict[entity_id] → set[entity_type_ids]           │
+  │  relation_constraints: dict[rel_id] → (domain_types, range_types)       │
+  │  transitive_relations: set[rel_id]                                       │
+  │  symmetric_relations:  set[rel_id]                                       │
+  │  inverse_relations:    dict[rel_id] → rel_id                            │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  get_symbolic_score(head_id, rel_id, tail_id, entity_types, triple_scores):
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                                                                          │
+  │  score = 1.0                                                             │
+  │                                                                          │
+  │  STAGE 1: Type Constraint Check                                          │
+  │  ───────────────────────────────────────────────────────────────         │
+  │  domain_types, range_types = relation_constraints[rel_id]               │
+  │                                                                          │
+  │  head_type = entity_types[head_id]                                       │
+  │  tail_type = entity_types[tail_id]                                       │
+  │                                                                          │
+  │  if head_type not in domain_types:  score *= 0.5   (domain violation)  │
+  │  if tail_type not in range_types:   score *= 0.5   (range violation)   │
+  │                                                                          │
+  │  → score ∈ {1.0, 0.5, 0.25}  after constraint check                    │
+  │                                                                          │
+  │  STAGE 2: Rule Body Satisfaction                                         │
+  │  ────────────────────────────────────────────────────────────────         │
+  │  For each rule with rule.head_relation == rel_id:                       │
+  │                                                                          │
+  │    _check_rule_body(head_id, tail_id, rule.body_relations, triple_scores)│
+  │    ├─ For body = [r1, r2]:                                               │
+  │    │    For each intermediate entity x in known entities:               │
+  │    │      if triple_scores[(head_id, r1, x)] > 0.5                      │
+  │    │        AND triple_scores[(x,  r2, tail_id)] > 0.5:                 │
+  │    │          return True   (rule body is satisfied)                     │
+  │    └─ return False                                                       │
+  │                                                                          │
+  │    if rule body satisfied:                                               │
+  │      score *= (1.0 + rule.confidence)      (multiplicative boost)       │
+  │                                                                          │
+  │  STAGE 3: Relation Property Boosts                                       │
+  │  ────────────────────────────────────────────────────────────────         │
+  │  if rel_id in symmetric_relations:  score *= 1.10   (10% boost)         │
+  │  if rel_id in inverse_relations:    score *= 1.05   (5%  boost)         │
+  │                                                                          │
+  │  score = min(score, 1.0)                   (clamp to [0, 1])            │
+  │  return score                                                            │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  COMPONENT B — HybridScorer
+  ─────────────────────────────────────────────────────────────────────
+
+  Fuses neural and symbolic scores into a single ranking score.
+
+  Parameters:
+    neural_weight   = 0.7  (configurable)
+    symbolic_weight = 0.3  (configurable)
+    fusion_method   = 'weighted_sum' | 'product' | 'mlp'
+
+  ┌─────────────────────┐  ┌─────────────────────┐
+  │   score_neural      │  │   score_symbolic     │
+  │   ∈ [0, 1]         │  │   ∈ [0, 1]          │
+  │   from EdgeModel    │  │   from Symbolic      │
+  │                     │  │   Reasoner           │
+  └──────────┬──────────┘  └──────────┬───────────┘
+             │                        │
+             └───────────┬────────────┘
+                         ▼
+            ┌────────────────────────────┐
+            │       HybridScorer         │
+            │                            │
+            │  METHOD 1: weighted_sum    │
+            │  ─────────────────────     │
+            │  score = 0.7×n + 0.3×s    │
+            │                            │
+            │  METHOD 2: product         │
+            │  ─────────────────────     │
+            │  score = n × s             │
+            │  (both must be high)       │
+            │                            │
+            │  METHOD 3: mlp             │
+            │  ─────────────────────     │
+            │  [n, s] → Linear(2→64)     │
+            │         → ReLU             │
+            │         → Linear(64→1)     │
+            │         → Sigmoid          │
+            │  (learned fusion weights)  │
+            └────────────┬───────────────┘
+                         │
+                         ▼
+                   score_final ∈ [0, 1]
+
+
+  COMPONENT C — NeuroSymbolicEdgeModel  [neuro_symbolic_integration.py]
+  ─────────────────────────────────────────────────────────────────────
+
+  Wraps the neural EdgeModel from the DKG system:
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  NeuroSymbolicEdgeModel.score_candidates(                                │
+  │      static_emb, dynamic_emb, dynamic_rel_emb,                          │
+  │      head, relation, candidate_tails,                                    │
+  │      entity_types, triple_scores_dict)                                  │
+  │                                                                          │
+  │  For each candidate tail t_c in candidate_tails:                        │
+  │    neural_score  = base_edge_model(h, r, t_c, ...)                      │
+  │    symbolic_score = reasoner.get_symbolic_score(h, r, t_c, ...)         │
+  │    fused_score    = hybrid_scorer(neural_score, symbolic_score)          │
+  │                                                                          │
+  │  Return: fused_scores [num_candidates]                                  │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  COMPONENT D — SymbolicRankingBooster  [neuro_symbolic_integration.py]
+  ─────────────────────────────────────────────────────────────────────
+
+  Post-processing approach — adjusts neural ranking AFTER scoring:
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  At eval time, for query (head, relation, ?):                           │
+  │                                                                          │
+  │  1. Neural model generates raw scores for all 13,645 candidates         │
+  │     neural_scores [13645] from EdgeModel                                 │
+  │                                                                          │
+  │  2. Compute symbolic boost for each candidate:                          │
+  │     sym_score = reasoner.get_symbolic_score(h, r, t_candidate, ...)     │
+  │     boost = (sym_score - 0.5) × boost_factor   (boost_factor = 0.3)     │
+  │     adjusted = neural_score × (1.0 + boost)                             │
+  │                                                                          │
+  │     If sym_score > 0.5: candidate gets a positive boost                 │
+  │     If sym_score < 0.5: candidate gets a negative boost (penalty)       │
+  │                                                                          │
+  │  3. Re-rank by adjusted scores                                          │
+  │     → improved rank for symbolically valid candidates                   │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  PRE-BUILT: FinancialKGConfiguration  [neuro_symbolic_integration.py]
+  ─────────────────────────────────────────────────────────────────────
+
+  One-line setup for FinDKG financial domain rules:
+
+  FinancialKGConfiguration.configure_edge_model(edge_model, num_entities,
+                                                 num_relations, device)
+
+  Automatically adds:
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  Domain Rules:                                                           │
+  │    Control  ←  Control ^ Control     (transitivity of control)          │
+  │    Has      ←  Relate_To ^ Has       (association chain)                │
+  │    Impact   ←  Relate_To ^ Impact    (influence chain)                  │
+  │                                                                          │
+  │  Domain/Range Constraints:                                               │
+  │    Control:   domain={ORG, PERSON, GPE}, range={ORG, COMP, GPE}        │
+  │    Operate_In: domain={COMP, ORG}, range={GPE}                          │
+  │    Has:       domain={COMP, ORG}, range={EVENT, COMP}                  │
+  │                                                                          │
+  │  Relation Properties:                                                    │
+  │    Transitive: Control, Operate_In                                       │
+  │    Symmetric:  Relate_To                                                 │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ EVALUATION PIPELINE  [DKG/utils/neuro_symbolic_eval.py]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  NeuroSymbolicEvaluator.evaluate(
+      neural_model, ns_model, test_loader, entire_G, entity_types)
+
+  For each query triple (h, r, t) from valid.txt / test.txt:
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                                                                          │
+  │  Neural-only ranking:                                                    │
+  │    score_n[c] = EdgeModel(h, r, c)  for all c                           │
+  │    sort descending → rank_neural                                         │
+  │                                                                          │
+  │  Neuro-symbolic ranking:                                                 │
+  │    score_ns[c] = HybridScorer(                                           │
+  │                    EdgeModel(h, r, c),                                   │
+  │                    SymbolicReasoner(h, r, c))                            │
+  │    sort descending → rank_ns                                             │
+  │                                                                          │
+  │  Per-query comparison:                                                   │
+  │    rank_neural = position of true tail t in neural ranking              │
+  │    rank_ns     = position of true tail t in ns ranking                  │
+  │    delta       = rank_neural - rank_ns   (positive = improved)          │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  Computed Metrics (NeuroSymbolicMetrics dataclass):
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  Ranking Metrics:                                                        │
+  │    MRR          = mean(1 / rank)  over all test triples                 │
+  │    Hits@1       = % where rank ≤ 1                                       │
+  │    Hits@3       = % where rank ≤ 3                                       │
+  │    Hits@10      = % where rank ≤ 10                                      │
+  │                                                                          │
+  │  Improvement Metrics (neuro-symbolic vs neural only):                   │
+  │    mrr_improvement  = (MRR_ns - MRR_n) / MRR_n × 100%                  │
+  │    hits_1_improvement, hits_3_improvement, hits_10_improvement          │
+  │                                                                          │
+  │  Symbolic Quality Metrics:                                               │
+  │    constraint_violations  = # predictions that violate type constraints  │
+  │    rules_applied          = # times a symbolic rule boosted a score      │
+  │    avg_symbolic_score     = mean symbolic score across all predictions   │
+  │                                                                          │
+  │  Ranking Analysis (RankingComparison per prediction):                   │
+  │    improvement_type: 'improved' | 'degraded' | 'unchanged'              │
+  │    improvement_rate = % of predictions where ns rank < neural rank      │
+  │    avg_rank_improvement, avg_rank_degradation, net_rank_change          │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ END-TO-END FLOW (SINGLE VALIDATION STEP WITH NEURO-SYMBOLIC)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  valid.txt triple: (h=12, r=1, t=6582)
+  = (Donald Trump, Control, China)
+       │
+       ▼
+  EmbeddingUpdater (no grad)
+  → combined_emb [13645, 400]
+       │
+       ├──────────────────────────────────────────────────────────┐
+       │                                                          │
+       ▼                                                          ▼
+  EdgeModel.score_all_tails(h=12, r=1)            SymbolicReasoner.get_score
+  → neural_scores [13645]                          (h=12, r=1, t_c)
+                                                   for each candidate t_c
+    Sort by neural_scores                          ─────────────────────────
+    raw_rank of t=6582 = K_n                       Stage 1: type constraint
+                                                     h_type = PERSON ✓
+                                                     t_type check ✓ or ✗
+                                                   Stage 2: rule check
+                                                     Control ← Control^Control
+                                                     body satisfied? → boost
+                                                   Stage 3: property boost
+                                                     Transitive? symmetric?
+                                                   → symbolic_scores [13645]
+       │                                                          │
+       └──────────────────────┬───────────────────────────────────┘
+                              ▼
+                HybridScorer (weighted_sum)
+                fused[c] = 0.7×neural[c] + 0.3×symbolic[c]
+                → fused_scores [13645]
+
+                Sort by fused_scores
+                ns_rank of t=6582 = K_ns
+
+                Comparison:
+                  K_ns < K_n  → "improved" (symbolic helped)
+                  K_ns > K_n  → "degraded" (symbolic hurt)
+                  K_ns = K_n  → "unchanged"
+                      │
+                      ▼
+                Aggregate over all valid.txt queries
+                → MRR, Hits@{1,3,10}, improvement %
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ CLASS HIERARCHY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Ruleformer [ruleformer-findkg/]
+  │
+  ├── Translator                              [transformer/Translator.py]
+  │   ├── model: Transformer
+  │   ├── train()                             train model on triples
+  │   └── decode_rule()                       extract rules from attention
+  │
+  ├── Transformer (nn.Module)                 [transformer/Models.py]
+  │   ├── encoder: Encoder
+  │   │   └── layer_stack: ModuleList[EncoderLayer]  × n_layers
+  │   │       ├── slf_attn: MultiHeadAttention       (relation-aware)
+  │   │       └── pos_ffn:  PositionwiseFeedForward
+  │   ├── decoder: Decoder
+  │   │   └── layer_stack: ModuleList[DecoderLayer]  × n_layers
+  │   │       ├── slf_attn: MultiHeadAttention       (masked, causal)
+  │   │       ├── enc_attn: MultiHeadAttention       (cross-attention)
+  │   │       └── pos_ffn:  PositionwiseFeedForward
+  │   └── trg_word_prj: Linear(d_model → N_RELATIONS)
+  │
+  ├── DataBase                                [transformer/dataset.py]
+  │   ├── extract_without_token()             subgraph extraction
+  │   └── load()                              entity/relation/triple loading
+  │
+  └── pickleDataset (Dataset)                 [transformer/dataset.py]
+      ├── __getitem__()                        get (subgraph, relations, length)
+      └── collate_fn()                         batch forward+reverse pairs
+
+  Neuro-Symbolic Integration [DKG/]
+  │
+  ├── SymbolicReasoner                        [model/neuro_symbolic.py]
+  │   ├── add_rule(SymbolicRule)
+  │   ├── add_type_constraint()
+  │   ├── add_relation_constraint()
+  │   ├── mark_transitive_relation()
+  │   ├── mark_symmetric_relation()
+  │   ├── set_inverse_relations()
+  │   ├── get_type_constraints()
+  │   ├── apply_rules()
+  │   └── get_symbolic_score()
+  │
+  ├── HybridScorer (nn.Module)               [model/neuro_symbolic.py]
+  │   └── forward(neural_scores, symbolic_scores)
+  │
+  ├── NeuroSymbolicLinkPredictor (nn.Module) [model/neuro_symbolic.py]
+  │   ├── reasoner: SymbolicReasoner
+  │   ├── hybrid_scorer: HybridScorer
+  │   └── forward(neural_scores, heads, rels, tails)
+  │
+  ├── NeuroSymbolicEdgeModel                 [model/neuro_symbolic_integration.py]
+  │   ├── base_edge_model: EdgeModel         (from neural DKG model)
+  │   ├── ns_predictor: NeuroSymbolicLinkPredictor
+  │   └── score_candidates()
+  │
+  ├── SymbolicRankingBooster                 [model/neuro_symbolic_integration.py]
+  │   ├── reasoner: SymbolicReasoner
+  │   ├── boost_factor: float
+  │   └── boost_scores(neural_scores, h, r, candidates)
+  │
+  ├── FinancialKGConfiguration               [model/neuro_symbolic_integration.py]
+  │   └── configure_edge_model()             one-line FinDKG setup
+  │
+  └── NeuroSymbolicEvaluator                 [utils/neuro_symbolic_eval.py]
+      ├── evaluate()
+      └── compare_rankings()
+
+  Rule Application [DKG/symbolic/]
+  │
+  ├── parse_rules()                           parse rules.txt
+  ├── load_kg()                               build hr_t dict
+  ├── _apply_rule()                           forward chain one rule
+  └── apply_rules_to_kg()                     full pipeline → sym_triplets.tsv
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ KEY HYPERPARAMETERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  RULEFORMER — Architecture
+  ──────────────────────────────────────────────────
+  d_model (embedding dim)         200 – 256
+  n_layers (encoder + decoder)    2 – 6
+  n_head (attention heads)        4 – 8
+  d_k, d_v (key/value dims)       50 – 64
+  d_inner (FFN hidden dim)        2048
+  dropout                         0.1
+  n_position (max seq length)     200 – 300
+
+  RULEFORMER — Training
+  ──────────────────────────────────────────────────
+  batch_size                      5 – 32
+  epochs                          10 – 50
+  optimizer                       Adam(β=(0.9, 0.98), ε=1e-9)
+  lr schedule                     warmup (400 steps) + inv-sqrt decay
+  label_smoothing                 0.0 – 0.1
+
+  RULEFORMER — Data Processing
+  ──────────────────────────────────────────────────
+  jump (hops / rule length)       1 – 3
+  padding (max subgraph nodes)    40 – 300
+  maxN (max neighbors per rel)    10 – 70
+
+  RULE EXTRACTION — Thresholds
+  ──────────────────────────────────────────────────
+  the_rel     (relative, per step)    0.6  (keep ≥ 60% of max attention)
+  the_rel_min (absolute floor)        0.3  (fallback minimum)
+  the_all     (overall path weight)   0.1  (entire rule confidence ≥ 10%)
+
+  RULE APPLICATION — Filters
+  ──────────────────────────────────────────────────
+  min_weight                      0.1
+  min_count                       3
+
+  NEURO-SYMBOLIC SCORING
+  ──────────────────────────────────────────────────
+  neural_weight                   0.7  (default)
+  symbolic_weight                 0.3  (default)
+  fusion_method                   'weighted_sum' | 'product' | 'mlp'
+  boost_factor (ranking booster)  0.3
+  type violation penalty          × 0.5 per violation
+  symmetric relation boost        × 1.1
+  inverse relation boost          × 1.05
+  rule satisfaction boost         × (1.0 + rule.confidence)
+
+================================================================================

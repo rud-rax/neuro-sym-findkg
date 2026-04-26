@@ -1,0 +1,656 @@
+
+================================================================================
+              FinDKG NEURAL REASONING ARCHITECTURE
+              Dynamic Knowledge Graph Embedding with Temporal Reasoning
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 1: DATA PIPELINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  FinDKG_dataset/FinDKG/
+  ┌────────────────────┐  ┌────────────────────┐  ┌────────────────────┐
+  │     train.txt      │  │     valid.txt       │  │      test.txt      │
+  │                    │  │                    │  │                    │
+  │ head  rel  tail    │  │ head  rel  tail    │  │ head  rel  tail    │
+  │  12    1   6582    │  │ ...   ...  ...     │  │ ...   ...  ...     │
+  │ 202    3      3    │  │ (mid timestamps)   │  │ (later timestamps) │
+  │ ...   ...   ...    │  │                    │  │                    │
+  │ (early timestamps) │  │                    │  │                    │
+  └────────────────────┘  └────────────────────┘  └────────────────────┘
+           │                        │                        │
+           └────────────────────────┴────────────────────────┘
+                                    │
+                                    ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │         load_temporal_knowledge_graph()   [DKG/data.py]                 │
+  │                                                                         │
+  │  + entity2id.txt   (13,645 entities, 12 types: PERSON, GPE, ORG, ...)  │
+  │  + relation2id.txt (15 relations: Relate_To, Control, Operate_In, ...) │
+  │  + stat.txt        (13645 entities, 15 relations, 261 timestamps)       │
+  │                                                                         │
+  │  Builds DGL Temporal Knowledge Graph G:                                 │
+  │    G.nodes  = 13,645  (one per entity)                                 │
+  │    G.edges  = all (head, tail) pairs from all splits                   │
+  │    G.ndata['node_type']  = entity type id (0-11)                       │
+  │    G.edata['rel_type']   = relation id (0-14)                          │
+  │    G.edata['time']       = float timestamp                              │
+  │    G.edata['train_mask'] = boolean mask for train edges                │
+  │    G.edata['val_mask']   = boolean mask for val edges                  │
+  │    G.edata['test_mask']  = boolean mask for test edges                 │
+  │    G.train_times / G.val_times / G.test_times = unique timestamps      │
+  └─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                  collate_fn()  [DKG/utils/model_utils.py]               │
+  │                                                                         │
+  │  For each batch of timestamps [t0 ... tN]:                             │
+  │                                                                         │
+  │  ┌───────────────────────────────────────────────────────────────────┐ │
+  │  │  prior_G   │  edges with time  < t0   (historical context)        │ │
+  │  │  batch_G   │  edges with t0 <= time <= tN  (current prediction)  │ │
+  │  │  cumul_G   │  edges with time <= tN   (cumulative for updates)    │ │
+  │  └───────────────────────────────────────────────────────────────────┘ │
+  │                                                                         │
+  │  Each subgraph also gets:                                              │
+  │    - comp_deg_norm(): node degree normalization for R-GCN              │
+  │    - Copied metadata (num_relations, time_interval, etc.)              │
+  └─────────────────────────────────────────────────────────────────────────┘
+                                    │
+                          ┌─────────┴──────────┐
+                          ▼                    ▼
+                    Training Loop          Eval Loop
+                    (train.txt             (valid.txt
+                    timestamps)            timestamps)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 2: EMBEDDING INITIALIZATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  STATIC EMBEDDINGS (learned, updated by gradient, not by RNN)           │
+  │                                                                          │
+  │  static_entity_emb          shape: (13645,  200)  nn.Embedding          │
+  │  static_relation_emb        shape: (   15,  200)  nn.Embedding          │
+  │                                                                          │
+  │  DYNAMIC EMBEDDINGS (updated by RNN at each timestep)                  │
+  │                                                                          │
+  │  MultiAspectEmbedding = namedtuple(['structural', 'temporal'])          │
+  │                                                                          │
+  │  dynamic_entity_emb:                                                    │
+  │    .structural   shape: (13645, n_rnn_layers=1,  200)    RNN h-state    │
+  │    .temporal     shape: (13645, n_rnn_layers=1,  200, 2) dir={fwd,rev}  │
+  │                                                                          │
+  │  dynamic_relation_emb:                                                  │
+  │    .structural   shape: (   15, n_rnn_layers=1,  200, 2) dir={src,dst}  │
+  │    .temporal     shape: (   15, n_rnn_layers=1,  200, 2) dir={src,dst}  │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 3: TRAINING LOOP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                    train.py  main()                                      │
+  │                                                                          │
+  │   Initialize model, static_emb, dynamic_emb                             │
+  │   Setup AdamW optimizers (lr=0.001, weight_decay=1e-5)                  │
+  │   Setup EarlyStopping (patience=30, monitor=MRR)                        │
+  │                                                                          │
+  │   for epoch in range(epochs=300):                                        │
+  │   │                                                                      │
+  │   │  ╔═══════════════════════════════════════════════════════════════╗  │
+  │   │  ║  TRAINING PHASE                                               ║  │
+  │   │  ╠═══════════════════════════════════════════════════════════════╣  │
+  │   │  ║                                                               ║  │
+  │   │  ║  for batch_i, (prior_G, batch_G, cumul_G)                    ║  │
+  │   │  ║         in DataLoader(train_times):                          ║  │
+  │   │  ║  │                                                            ║  │
+  │   │  ║  │  1. EmbeddingUpdater.forward(prior_G, batch_G, cumul_G)  ║  │
+  │   │  ║  │     → updated dynamic_entity_emb, dynamic_relation_emb   ║  │
+  │   │  ║  │                                                            ║  │
+  │   │  ║  │  2. compute_loss(batch_G, static_emb, dynamic_emb):      ║  │
+  │   │  ║  │     → loss_dict['edge']  = CrossEntropy link prediction   ║  │
+  │   │  ║  │     → loss_dict['time']  = NegLogLik time prediction      ║  │
+  │   │  ║  │     → total_loss = edge_loss + time_loss                  ║  │
+  │   │  ║  │                                                            ║  │
+  │   │  ║  │  3. Accumulate loss                                        ║  │
+  │   │  ║  │                                                            ║  │
+  │   │  ║  │  4. Every 20 batches (rnn_truncate_every):                ║  │
+  │   │  ║  │     total_loss.backward()                                  ║  │
+  │   │  ║  │     optimizer.step()                                       ║  │
+  │   │  ║  │     optimizer.zero_grad()                                  ║  │
+  │   │  ║  │     Detach RNN hidden states (truncated BPTT)             ║  │
+  │   │  ║  │                                                            ║  │
+  │   │  ╚═══════════════════════════════════════════════════════════════╝  │
+  │   │                                                                      │
+  │   │  ╔═══════════════════════════════════════════════════════════════╗  │
+  │   │  ║  VALIDATION PHASE (every eval_every epochs)                   ║  │
+  │   │  ╠═══════════════════════════════════════════════════════════════╣  │
+  │   │  ║                                                               ║  │
+  │   │  ║  for batch in DataLoader(valid_times):                       ║  │
+  │   │  ║    → EmbeddingUpdater (no grad)                              ║  │
+  │   │  ║    → compute_loss on valid triples                           ║  │
+  │   │  ║    → rank all 13,645 candidates per query                    ║  │
+  │   │  ║    → compute MRR, Recall@{1,3,10,100}, MAE, RMSE            ║  │
+  │   │  ║                                                               ║  │
+  │   │  ║  EarlyStopping.check(MRR):                                   ║  │
+  │   │  ║    - If improved → save best model checkpoint                ║  │
+  │   │  ║    - If no improvement for 30 epochs → stop training         ║  │
+  │   │  ║                                                               ║  │
+  │   │  ╚═══════════════════════════════════════════════════════════════╝  │
+  │                                                                          │
+  │   Load best checkpoint → Final evaluation on test.txt                   │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 4: EMBEDDING UPDATER  [DKG/model/embedding.py]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  EmbeddingUpdater.forward(prior_G, batch_G, cumul_G, static_emb, dynamic_emb)
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  (A) STRUCTURAL BRANCH: What happened in the graph?                     │
+  │      GraphStructuralRNNConv                                              │
+  │                                                                          │
+  │  cumul_G ──► Graph Convolution ──────────────────────────────────────── │
+  │              (RGCN or KGTransformer)                                     │
+  │              input:  static_entity_emb  (13645, 200)                    │
+  │              output: conv_out           (13645, 200)                    │
+  │                                │                                         │
+  │                                ▼                                         │
+  │              Structural RNN (GRU or vanilla RNN)                        │
+  │              input:  conv_out + optional static_emb                     │
+  │              h_prev: structural dynamic_emb    (13645, 1, 200)          │
+  │              h_new:  updated structural emb    (13645, 1, 200)          │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  (B) TEMPORAL BRANCH: When did events happen?                           │
+  │      GraphTemporalRNNConv                                                │
+  │                                                                          │
+  │  Compute inter-event times for each edge in batch_G:                    │
+  │    recipient_iet = time_current - time_last_incoming_event               │
+  │    sender_iet    = time_current - time_last_outgoing_event               │
+  │                                                                          │
+  │  TimeIntervalTransform: iet → log(iet)  [optional normalize]            │
+  │                                                                          │
+  │  FORWARD direction (recipient / incoming):                              │
+  │  batch_G ──► Graph Conv (time-decay normalized) ──► Temporal RNN fwd   │
+  │              input:  static_entity_emb, recipient_iet                   │
+  │              h_prev: temporal dynamic_emb[:,0]   (13645, 1, 200)        │
+  │              h_new:  updated temporal emb fwd    (13645, 1, 200)        │
+  │                                                                          │
+  │  REVERSE direction (sender / outgoing):                                 │
+  │  rev_batch_G ─► Graph Conv (time-decay normalized) ──► Temporal RNN rev │
+  │              input:  static_entity_emb, sender_iet                      │
+  │              h_prev: temporal dynamic_emb[:,1]   (13645, 1, 200)        │
+  │              h_new:  updated temporal emb rev    (13645, 1, 200)        │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  (C) RELATION BRANCH: How do relations evolve?                          │
+  │      RelationRNN (for structural and temporal each)                     │
+  │                                                                          │
+  │  batch_G edges grouped by relation type:                                │
+  │    for each relation r in 0..14:                                         │
+  │      entity_emb_r = mean of embeddings of entities connected by r       │
+  │      (scatter_mean over head and tail nodes separately)                 │
+  │      RNN update → new dynamic_relation_emb[r]                          │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  Output: (updated_dynamic_entity_emb, updated_dynamic_relation_emb)
+          both as MultiAspectEmbedding(structural=..., temporal=...)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 5: GRAPH CONVOLUTION BACKENDS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  OPTION A: R-GCN  [DKG/model/gnn/rgcn.py]
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  for layer in range(num_gconv_layers=2):                                │
+  │                                                                         │
+  │    h_new[v] = σ( Σ_{r} Σ_{u ∈ N_r(v)} (1/c_{v,r}) * W_r * h[u]       │
+  │                  + W_0 * h[v] )                                         │
+  │                                                                         │
+  │    c_{v,r} = degree normalization (comp_deg_norm)                       │
+  │    W_r     = relation-specific weight matrix  (one per relation)        │
+  │    W_0     = self-connection weight matrix                               │
+  │    σ       = activation (tanh)                                          │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  OPTION B: KGTransformer  [DKG/model/gnn/kgt.py]
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  for layer in range(num_gconv_layers=2):                                │
+  │                                                                         │
+  │    Multi-head attention over neighborhood:                              │
+  │    α_{u,v,r} = softmax( (Q_v · K_{u,r}) / √d )                        │
+  │    h_new[v]  = σ( Σ_{u,r} α_{u,v,r} * V_{u,r} )                       │
+  │                                                                         │
+  │    Q_v   = query from target node v                                     │
+  │    K_u,r = key from source node u via relation r                        │
+  │    V_u,r = value from source node u via relation r                      │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 6: COMBINER  [DKG/model/model.py]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  static_entity_emb.structural      (13645, 200)
+  dynamic_entity_emb.structural     (13645, 1, 200)
+           │                               │
+           └──────────────┬────────────────┘
+                          ▼
+            StaticDynamicCombiner
+            mode = 'concat'  →  [static | dynamic]  (13645, 400)
+            mode = 'static_only' →  static  (13645, 200)
+            mode = 'dynamic_only' → dynamic (13645, 200)
+                          │
+                          ▼
+            (optional) Additional RGCN on combined emb
+                          │
+                          ▼
+            combined_emb  (13645, combined_dim)  ← used by EdgeModel
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 7: EDGE MODEL — LINK PREDICTION  [DKG/model/model.py]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Input: batch_G triples (h, r, t), combined_emb, static_rel_emb, dyn_rel_emb
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  GraphReadout                                                             │
+  │  Reduces all node embeddings → single graph-level context vector        │
+  │  Method: max / mean / weighted_sum over combined_emb                    │
+  │  Output: graph_emb  (1, graph_emb_dim)                                  │
+  └──────────────────────────────────────────────────────────────────────────┘
+                           │
+       ┌───────────────────┼───────────────────┐
+       ▼                   ▼                   ▼
+  ┌─────────┐        ┌──────────┐        ┌──────────┐
+  │log_prob │        │log_prob  │        │log_prob  │
+  │  _tail  │        │  _rel    │        │  _head   │
+  │         │        │          │        │          │
+  │head_emb │        │head_emb  │        │graph_emb │
+  │graph_emb│        │graph_emb │        │          │
+  │rel_s_emb│        │          │        │          │
+  │rel_d_emb│        │          │        │          │
+  │         │        │          │        │          │
+  │concat → │        │concat →  │        │Linear →  │
+  │Linear → │        │Linear →  │        │4x hidden │
+  │2x hidden│        │  dim     │        │tanh      │
+  │tanh     │        │tanh      │        │Linear →  │
+  │Linear → │        │Linear →  │        │13645     │
+  │13645    │        │15 rels   │        │CrossEnt  │
+  │CrossEnt │        │CrossEnt  │        │(head_id) │
+  │(tail_id)│        │(rel_id)  │        └──────────┘
+  └─────────┘        └──────────┘
+       │                   │                    │
+       └─────────────┬─────┘                    │
+                     ▼                          │
+  log_prob = log_prob_tail                      │
+           + 0.2 * log_prob_rel                 │
+           + 0.1 * log_prob_head  ◄─────────────┘
+
+  edge_loss = -log_prob   (negative log-likelihood)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 8: INTER-EVENT TIME MODEL — TIME PREDICTION  [DKG/model/tpp/]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Input: batch_G, dynamic_entity_emb.temporal, dynamic_relation_emb.temporal
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  Context Assembly                                                         │
+  │                                                                          │
+  │  sender_emb    = temporal_emb[head_node]   (per edge)                   │
+  │  recipient_emb = temporal_emb[tail_node]   (per edge)                   │
+  │  rel_emb       = dynamic_relation_emb[rel] (per edge)                   │
+  │                                                                          │
+  │  context = concat(sender_emb, recipient_emb, rel_emb_src, rel_emb_dst)  │
+  │            shape: (num_edges, 2*200 + 2*200) = (num_edges, 800)         │
+  └──────────────────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  LogNormMixTPP  [log_norm_mix_tpp.py]                                    │
+  │                                                                          │
+  │  context_to_params: Sequential(Linear → Tanh → Linear)                  │
+  │    output: (locs, log_scales, log_weights)                               │
+  │             each of shape  (num_edges, K=128)                           │
+  │                                                                          │
+  │  LogNormalMixtureDistribution:                                           │
+  │                                                                          │
+  │    p(Δt | context) = Σ_{k=1}^{128} w_k · LogNormal(μ_k, σ_k)(Δt)      │
+  │                                                                          │
+  │    where w_k = softmax(log_weights)_k                                    │
+  │          μ_k = locs_k                                                   │
+  │          σ_k = exp(log_scales_k)                                         │
+  │                                                                          │
+  │  log_prob_density = log Σ_k w_k · LogNormal(μ_k, σ_k)(Δt_observed)     │
+  └──────────────────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+  time_loss = -log_prob_density   (negative log-likelihood)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 9: LOSS COMPUTATION & OPTIMIZATION  [DKG/train.py]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │                       compute_loss()                                     │
+  │                                                                          │
+  │  batch_G (triples from train.txt)                                        │
+  │       │                                                                  │
+  │       ├──[edge branch]──────────────────────────────────────────────┐   │
+  │       │                                                             │   │
+  │       │  combiner(static_emb.structural, dynamic_emb.structural)    │   │
+  │       │           → combined_emb  (13645, combined_dim)             │   │
+  │       │                                                              │   │
+  │       │  edge_model(batch_G, combined_emb, rel_embs)                │   │
+  │       │           → log_prob  (scalar)                              │   │
+  │       │                                                              │   │
+  │       │  loss_dict['edge'] = -log_prob                              │   │
+  │       │                                                              ▼   │
+  │       │                                              ┌──────────────────┐│
+  │       │                                              │  total_loss       ││
+  │       │  inter_event_time_model(batch_G,             │  = edge_loss      ││
+  │       │        dynamic_emb.temporal,                 │  + time_loss      ││
+  │       │        dynamic_rel_emb.temporal)             └──────────────────┘│
+  │       │           → log_prob_density                                  ▲   │
+  │       │                                                              │   │
+  │       │  loss_dict['time'] = -log_prob_density        ──────────────┘   │
+  │       │                                                                  │
+  │       └──[time branch]─────────────────────────────────────────────┘   │
+  │                                                                          │
+  │  Optimizer: AdamW(lr=0.001, weight_decay=1e-5)                          │
+  │  Gradient clipping: via truncated BPTT every 20 batches                 │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 10: VALIDATION & EVALUATION  [DKG/eval.py]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  evaluate(model, data_loader=valid_times, entire_G, ...)
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  LOSS EVALUATION                                                         │
+  │                                                                          │
+  │  for batch in valid_times:                                               │
+  │    → Run EmbeddingUpdater (no_grad)                                     │
+  │    → compute_loss(batch_G from valid.txt)                               │
+  │    → report: val_loss_edge, val_loss_time, val_loss_total               │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  LINK PREDICTION EVALUATION  (full_link_pred_eval=True)                  │
+  │                                                                          │
+  │  For each query triple (h, r, ?) from valid.txt:                        │
+  │                                                                          │
+  │    1. Score ALL 13,645 entities as candidate tails:                     │
+  │       for c in range(num_entities):                                      │
+  │         score[c] = edge_model.log_prob_tail(h_emb, graph_emb, r, c)    │
+  │                                                                          │
+  │    2. Sort candidates by score (descending):                            │
+  │       rank = position of true tail t in sorted list                     │
+  │                                                                          │
+  │    3. Compute ranking metrics:                                          │
+  │                                                                          │
+  │       MRR      = mean(1/rank)  over all valid queries                   │
+  │       Rec@1    = % of queries where rank ≤ 1                            │
+  │       Rec@3    = % of queries where rank ≤ 3                            │
+  │       Rec@10   = % of queries where rank ≤ 10                           │
+  │       Rec@100  = % of queries where rank ≤ 100                          │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  TIME PREDICTION EVALUATION  (time_pred_eval=True)                       │
+  │                                                                          │
+  │  For each edge in valid.txt:                                             │
+  │    predicted_Δt = E[Δt | context]  (expected value from TPP mixture)    │
+  │    actual_Δt   = observed inter-event time                              │
+  │                                                                          │
+  │    MAE  = mean |predicted_Δt - actual_Δt|                               │
+  │    RMSE = sqrt( mean (predicted_Δt - actual_Δt)^2 )                     │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  EARLY STOPPING  [DKG/utils/train_utils.py]                              │
+  │                                                                          │
+  │  Monitor: MRR on validation set                                         │
+  │  patience = 30 epochs                                                    │
+  │                                                                          │
+  │  if MRR > best_MRR:                                                      │
+  │      best_MRR = MRR                                                      │
+  │      save_checkpoint(model, static_emb, dynamic_emb)                    │
+  │      patience_counter = 0                                                │
+  │  else:                                                                   │
+  │      patience_counter += 1                                               │
+  │      if patience_counter >= 30:  stop training                          │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 11: OPTIONAL NEURO-SYMBOLIC LAYER  [DKG/model/neuro_symbolic*.py]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  (activated when use_neuro_symbolic=True in config/v1.json)
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  SymbolicReasoner                                                        │
+  │  ├─ Chain rules:     (A→B) ∧ (B→C)  ⟹  (A→C)                          │
+  │  ├─ Type constraints: relation r requires head ∈ TypeX, tail ∈ TypeY   │
+  │  ├─ Transitivity:    certain relations are transitive                   │
+  │  ├─ Symmetry:        certain relations are symmetric                    │
+  │  └─ Inverse pairs:   certain relations are inverses of each other       │
+  └──────────────────────────────────────────────────────────────────────────┘
+                           │
+                           ▼  symbolic_score per candidate
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  HybridScorer                                                            │
+  │                                                                          │
+  │  hybrid_score = neural_weight * neural_score                            │
+  │               + symbolic_weight * symbolic_score                        │
+  │                                                                          │
+  │  defaults: neural_weight=0.7, symbolic_weight=0.3                       │
+  └──────────────────────────────────────────────────────────────────────────┘
+                           │
+                           ▼  (at eval time)
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  SymbolicRankingBooster                                                  │
+  │  Post-processes neural ranking list:                                    │
+  │  + boost_factor=0.3 added to valid triples (pass type constraints)      │
+  │  - penalty applied to invalid triples (violate constraints)             │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 12: END-TO-END FLOW (SINGLE TRAINING STEP)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  train.txt timestamps
+        │
+        ▼
+  DataLoader (batch of timestamps)
+        │
+        ▼
+  collate_fn → (prior_G, batch_G, cumul_G)
+        │
+        ├──────────────────────────────────────────────────────────────────┐
+        │                                                                  │
+        ▼                                                                  │
+  EmbeddingUpdater                                                         │
+  │                                                                        │
+  ├── GraphStructuralRNNConv(cumul_G)                                      │
+  │     RGCN/KGT → GRU → new structural dynamic_emb                       │
+  │                                                                        │
+  ├── GraphTemporalRNNConv(batch_G, rev_batch_G)                           │
+  │     RGCN/KGT (time-weighted) → GRU → new temporal dynamic_emb         │
+  │                                                                        │
+  └── RelationRNN(batch_G)                                                 │
+        scatter_mean → GRU → new dynamic_relation_emb                     │
+        │                                                                  │
+        ▼                                                                  │
+  updated_dynamic_entity_emb (struct + temporal)                           │
+  updated_dynamic_relation_emb (struct + temporal)                         │
+        │                                                                  │
+        ├── EDGE PREDICTION BRANCH ─────────────────────────────────────┐ │
+        │                                                               │ │
+        │   Combiner                                                    │ │
+        │   [static_emb.structural | dynamic_emb.structural]           │ │
+        │   → combined_emb (13645, 400)                                 │ │
+        │                                                               │ │
+        │   EdgeModel                                                   │ │
+        │   GraphReadout → graph_emb                                    │ │
+        │   log_prob_tail + 0.2*log_prob_rel + 0.1*log_prob_head        │ │
+        │   → edge_loss = -log_prob ─────────────────────────────────► │ │
+        │                                                               │ │
+        └── TIME PREDICTION BRANCH ─────────────────────────────────┐  │ │
+                                                                     │  │ │
+            InterEventTimeModel                                      │  │ │
+            context = [sender_emb | recipient_emb | rel_embs]       │  │ │
+            → MLP → (locs, log_scales, log_weights)  x 128          │  │ │
+            → LogNormal Mixture distribution                         │  │ │
+            → log p(Δt_observed)                                     │  │ │
+            → time_loss = -log_prob_density ────────────────────────► │ │
+                                                                        │ │
+                                              total_loss = edge_loss + time_loss
+                                                                        │
+                                         (every 20 steps)              │
+                                              total_loss.backward()    │
+                                              AdamW.step()             │
+                                              detach hidden states     │
+                                                                        │
+  ◄───────────────────────────────────────────────────────────────────────┘
+  (next batch — RNN continues from detached hidden state)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 13: END-TO-END FLOW (VALIDATION STEP)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  valid.txt timestamps
+        │
+        ▼
+  DataLoader (batch of valid timestamps)
+        │
+        ▼
+  collate_fn → (prior_G, batch_G, cumul_G)
+        │
+        ▼  [torch.no_grad()]
+  EmbeddingUpdater → updated embeddings (same as training, but no gradients)
+        │
+        ├── LOSS EVALUATION
+        │   compute_loss(batch_G from valid.txt)
+        │   → val_edge_loss, val_time_loss
+        │
+        ├── LINK PREDICTION EVALUATION
+        │   For each (h, r, ?) in valid batch:
+        │     score all 13,645 candidates
+        │     rank true tail t
+        │     → collect all ranks
+        │   → MRR, Rec@1, Rec@3, Rec@10, Rec@100
+        │
+        └── TIME PREDICTION EVALUATION
+            For each edge in valid batch:
+              E[Δt] from LogNormal mixture
+              compare with actual Δt
+            → MAE, RMSE
+                  │
+                  ▼
+  EarlyStopping.check(MRR)
+    improved?  → save checkpoint
+    no change for 30 epochs? → stop
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 14: CLASS HIERARCHY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  nn.Module
+  └── DynamicGraphModel                             [model/model.py]
+      ├── EmbeddingUpdater                          [model/embedding.py]
+      │   ├── GraphStructuralRNNConv
+      │   │   ├── graph_conv: RGCN | KGTransformer  [model/gnn/]
+      │   │   └── rnn_structural: nn.GRU | nn.RNN
+      │   ├── GraphTemporalRNNConv
+      │   │   ├── graph_conv: RGCN | KGTransformer
+      │   │   └── rnn_temporal: nn.GRU | nn.RNN
+      │   ├── RelationRNN (structural)
+      │   │   └── rnn_relation: nn.GRU | nn.RNN
+      │   └── RelationRNN (temporal)
+      │       └── rnn_relation: nn.GRU | nn.RNN
+      ├── Combiner
+      │   ├── StaticDynamicCombiner
+      │   └── (optional) graph_conv_static / graph_conv_dynamic: RGCN
+      ├── EdgeModel
+      │   ├── GraphReadout
+      │   ├── transform_tail: nn.Sequential(Linear, Tanh, Linear)
+      │   ├── transform_rel:  nn.Sequential(Linear, Tanh, Linear)
+      │   ├── transform_head: nn.Sequential(Linear, Tanh, Linear)
+      │   └── criterion: nn.CrossEntropyLoss
+      └── InterEventTimeModel
+          └── LogNormMixTPP                         [model/tpp/]
+              └── context_to_params: nn.Sequential(Linear, Tanh, Linear)
+                  → LogNormalMixtureDistribution (K=128 components)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SECTION 15: KEY HYPERPARAMETERS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Dataset
+  ─────────────────────────────────────────────
+  num_entities              13,645
+  num_relations             15
+  num_timestamps            261
+  entity_types              12  (PERSON, GPE, ORG, ...)
+
+  Embeddings
+  ─────────────────────────────────────────────
+  static_entity_embed_dim               200
+  structural_dynamic_entity_embed_dim   200
+  temporal_dynamic_entity_embed_dim     200
+  rel_embed_dim                         200
+  num_rnn_layers                        1
+  num_gconv_layers                      2
+  num_mix_components (TPP)              128
+
+  Training
+  ─────────────────────────────────────────────
+  epochs                    300
+  learning_rate             0.001
+  weight_decay              1e-5
+  dropout                   0.0
+  rnn_truncate_every        20   (truncated BPTT interval)
+  optimizer                 AdamW
+
+  Validation / Early Stopping
+  ─────────────────────────────────────────────
+  monitor_metric            MRR
+  patience                  30 epochs
+  eval_every                1 epoch
+
+  Loss Weights
+  ─────────────────────────────────────────────
+  log_prob_rel  coefficient  0.2
+  log_prob_head coefficient  0.1
+  log_prob_tail coefficient  1.0  (primary task)
+
+  Neuro-Symbolic (optional)
+  ─────────────────────────────────────────────
+  neural_weight             0.7
+  symbolic_weight           0.3
+  boost_factor              0.3
+
+================================================================================

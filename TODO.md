@@ -44,11 +44,11 @@ conda activate ./ruleformer_env
 # Install PyTorch 1.10 (CPU — swap for CUDA build if you have a GPU)
 pip install torch==1.10.0+cpu -f https://download.pytorch.org/whl/torch_stable.html
 
-# Replace cu113 with your CUDA version
+## Replace cu113 with your CUDA version
 pip install torch==1.10.0+cu113 -f https://download.pytorch.org/whl/torch_stable.html
 pip install numpy pandas
 
-# Install remaining dependencies
+## Install remaining dependencies
 pip install numpy pandas
 
 
