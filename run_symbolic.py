@@ -22,6 +22,7 @@ Skip flags (useful to resume a partial run):
 Provide explicit paths to skip auto-discovery:
     --ckpt  EXPS/findkg-j2-.../Translator50.ckpt
     --rules_file  EXPS/findkg-rule-.../rules.txt
+    --exps_dir /content/drive/MyDrive/FinDKG/EXPS
 """
 
 import argparse
@@ -120,8 +121,20 @@ def parse_args():
     p.add_argument("--rules_file", default=None, help="rules.txt path (skips auto-discovery)")
 
     # Ruleformer location
-    p.add_argument("--ruleformer_root", default="ruleformer-findkg",
-                   help="Path to Ruleformer repo (default: ./ruleformer-findkg)")
+    p.add_argument("--ruleformer_root", default="Ruleformer",
+                   help="Path to Ruleformer repo (default: ./Ruleformer)")
+
+    # Persistence
+    p.add_argument(
+        "--exps_dir",
+        default=None,
+        help=(
+            "Override EXPS directory for checkpoints and rule directories. "
+            "Defaults to <ruleformer_root>/EXPS. "
+            "Pass a Google Drive path (e.g. /content/drive/MyDrive/FinDKG/EXPS) "
+            "to persist across Colab session restarts."
+        ),
+    )
 
     return p.parse_args()
 
@@ -136,7 +149,11 @@ def main():
     python = sys.executable
     ruleformer_root = os.path.abspath(args.ruleformer_root)
     ruleformer_data = os.path.join(ruleformer_root, "DATASET", args.dataset)
-    exps_dir = os.path.join(ruleformer_root, "EXPS")
+    exps_dir = (
+        os.path.abspath(args.exps_dir)
+        if args.exps_dir
+        else os.path.join(ruleformer_root, "EXPS")
+    )
     train_desc = "findkg"
     decode_desc = "findkg-rule"
 
@@ -175,7 +192,7 @@ def main():
         print("\n[3/5] Training Ruleformer...")
         _run(
             [python, "translate.py",
-             f"-data={args.dataset}",
+             f"-data=DATASET/{args.dataset}",
              f"-jump={args.jump}",
              f"-padding={args.padding}",
              f"-batch_size={args.batch_size}",
@@ -198,7 +215,7 @@ def main():
         print(f"\n[4/5] Decoding rules from: {ckpt}")
         _run(
             [python, "translate.py",
-             f"-data={args.dataset}",
+             f"-data=DATASET/{args.dataset}",
              f"-jump={args.jump}",
              f"-padding={args.padding}",
              f"-batch_size={args.batch_size}",
