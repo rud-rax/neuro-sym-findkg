@@ -31,7 +31,6 @@ import subprocess
 import sys
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-_RULEFORMER_ROOT = os.path.join(_REPO_ROOT, "Ruleformer")
 
 # Import our helper modules (repo root must be on path)
 sys.path.insert(0, _REPO_ROOT)
@@ -120,6 +119,10 @@ def parse_args():
     p.add_argument("--ckpt", default=None, help="Checkpoint path (skips auto-discovery)")
     p.add_argument("--rules_file", default=None, help="rules.txt path (skips auto-discovery)")
 
+    # Ruleformer location
+    p.add_argument("--ruleformer_root", default="Ruleformer",
+                   help="Path to Ruleformer repo (default: ./Ruleformer)")
+
     return p.parse_args()
 
 
@@ -131,15 +134,24 @@ def main():
     args = parse_args()
 
     python = sys.executable
-    ruleformer_data = os.path.join(_RULEFORMER_ROOT, "DATASET", args.dataset)
-    exps_dir = os.path.join(_RULEFORMER_ROOT, "EXPS")
+    ruleformer_root = os.path.abspath(args.ruleformer_root)
+    ruleformer_data = os.path.join(ruleformer_root, "DATASET", args.dataset)
+    exps_dir = os.path.join(ruleformer_root, "EXPS")
     train_desc = "findkg"
     decode_desc = "findkg-rule"
+
+    if not os.path.isfile(os.path.join(ruleformer_root, "transformer", "dataset.py")):
+        sys.exit(
+            f"Ruleformer not found at: {ruleformer_root}\n"
+            "Clone it first:\n"
+            "  git clone https://github.com/zjukg/Ruleformer.git Ruleformer\n"
+            "Or pass a custom path with --ruleformer_root /path/to/Ruleformer"
+        )
 
     # ── Step 1: Adapt data ──────────────────────────────────────────────────
     if not args.skip_adapt:
         print("\n[1/5] Adapting FinDKG data to Ruleformer format...")
-        adapt_findkg_for_ruleformer(args.data_dir, args.dataset, _RULEFORMER_ROOT)
+        adapt_findkg_for_ruleformer(args.data_dir, args.dataset, ruleformer_root)
     else:
         print("\n[1/5] Skipping data adaptation.")
 
@@ -152,12 +164,13 @@ def main():
              f"-maxN={args.maxN}",
              f"-padding={args.padding}",
              f"-jump={args.jump}"],
-            cwd=_RULEFORMER_ROOT,
+            cwd=ruleformer_root,
         )
     else:
         print("\n[2/5] Skipping preprocessing.")
 
     # ── Step 3: Train Ruleformer ────────────────────────────────────────────
+    os.makedirs(exps_dir, exist_ok=True)  # translate.py uses os.mkdir for the run subdir
     if not args.skip_train:
         print("\n[3/5] Training Ruleformer...")
         _run(
@@ -172,8 +185,9 @@ def main():
              f"-n_layers={args.n_layers}",
              f"-dropout={args.dropout}",
              f"-desc={train_desc}",
-             f"-savestep={args.savestep}"],
-            cwd=_RULEFORMER_ROOT,
+             f"-savestep={args.savestep}",
+             f"-exps={exps_dir}/"],
+            cwd=ruleformer_root,
         )
     else:
         print("\n[3/5] Skipping training.")
@@ -197,8 +211,9 @@ def main():
              "-decode_rule",
              f"-the_rel={args.the_rel}",
              f"-the_rel_min={args.the_rel_min}",
-             f"-the_all={args.the_all}"],
-            cwd=_RULEFORMER_ROOT,
+             f"-the_all={args.the_all}",
+             f"-exps={exps_dir}/"],
+            cwd=ruleformer_root,
         )
     else:
         print("\n[4/5] Skipping rule decoding.")
