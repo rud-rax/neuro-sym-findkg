@@ -121,8 +121,8 @@ def parse_args():
     p.add_argument("--rules_file", default=None, help="rules.txt path (skips auto-discovery)")
 
     # Ruleformer location
-    p.add_argument("--ruleformer_root", default="Ruleformer",
-                   help="Path to Ruleformer repo (default: ./Ruleformer)")
+    p.add_argument("--ruleformer_root", default="ruleformer-findkg",
+                   help="Path to Ruleformer repo (default: ruleformer-findkg, resolved relative to this script)")
 
     # Persistence
     p.add_argument(
@@ -147,7 +147,13 @@ def main():
     args = parse_args()
 
     python = sys.executable
-    ruleformer_root = os.path.abspath(args.ruleformer_root)
+
+    def _abs(p):
+        """Resolve p: absolute paths unchanged, relative paths resolved from script dir."""
+        return p if os.path.isabs(p) else os.path.join(_REPO_ROOT, p)
+
+    ruleformer_root = _abs(args.ruleformer_root)
+    data_dir = _abs(args.data_dir)
     ruleformer_data = os.path.join(ruleformer_root, "DATASET", args.dataset)
     exps_dir = (
         os.path.abspath(args.exps_dir)
@@ -168,7 +174,7 @@ def main():
     # ── Step 1: Adapt data ──────────────────────────────────────────────────
     if not args.skip_adapt:
         print("\n[1/5] Adapting FinDKG data to Ruleformer format...")
-        adapt_findkg_for_ruleformer(args.data_dir, args.dataset, ruleformer_root)
+        adapt_findkg_for_ruleformer(data_dir, args.dataset, ruleformer_root)
     else:
         print("\n[1/5] Skipping data adaptation.")
 
@@ -241,7 +247,7 @@ def main():
     n = apply_rules_to_kg(
         rules_path=rules_file,
         ruleformer_train_path=os.path.join(ruleformer_data, "train.txt"),
-        data_dir=args.data_dir,
+        data_dir=data_dir,
         dataset=args.dataset,
         output_path=args.output,
         min_weight=args.min_rule_weight,
