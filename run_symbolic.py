@@ -120,8 +120,8 @@ def parse_args():
     p.add_argument("--rules_file", default=None, help="rules.txt path (skips auto-discovery)")
 
     # Ruleformer location
-    p.add_argument("--ruleformer_root", default="Ruleformer",
-                   help="Path to Ruleformer repo (default: ./Ruleformer)")
+    p.add_argument("--ruleformer_root", default="ruleformer-findkg",
+                   help="Path to Ruleformer repo (default: ./ruleformer-findkg)")
 
     return p.parse_args()
 
@@ -160,7 +160,7 @@ def main():
         print("\n[2/5] Preprocessing: building ego-centred subgraphs...")
         _run(
             [python, "transformer/dataset.py",
-             f"-data=DATASET/{args.dataset}",
+             f"-data={args.dataset}",
              f"-maxN={args.maxN}",
              f"-padding={args.padding}",
              f"-jump={args.jump}"],
@@ -175,7 +175,7 @@ def main():
         print("\n[3/5] Training Ruleformer...")
         _run(
             [python, "translate.py",
-             f"-data=DATASET/{args.dataset}",
+             f"-data={args.dataset}",
              f"-jump={args.jump}",
              f"-padding={args.padding}",
              f"-batch_size={args.batch_size}",
@@ -198,7 +198,7 @@ def main():
         print(f"\n[4/5] Decoding rules from: {ckpt}")
         _run(
             [python, "translate.py",
-             f"-data=DATASET/{args.dataset}",
+             f"-data={args.dataset}",
              f"-jump={args.jump}",
              f"-padding={args.padding}",
              f"-batch_size={args.batch_size}",
