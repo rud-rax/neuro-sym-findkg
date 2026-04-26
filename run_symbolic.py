@@ -170,6 +170,7 @@ def main():
         print("\n[2/5] Skipping preprocessing.")
 
     # ── Step 3: Train Ruleformer ────────────────────────────────────────────
+    os.makedirs(exps_dir, exist_ok=True)  # translate.py uses os.mkdir for the run subdir
     if not args.skip_train:
         print("\n[3/5] Training Ruleformer...")
         _run(
@@ -184,7 +185,8 @@ def main():
              f"-n_layers={args.n_layers}",
              f"-dropout={args.dropout}",
              f"-desc={train_desc}",
-             f"-savestep={args.savestep}"],
+             f"-savestep={args.savestep}",
+             f"-exps={exps_dir}/"],
             cwd=ruleformer_root,
         )
     else:
@@ -209,7 +211,8 @@ def main():
              "-decode_rule",
              f"-the_rel={args.the_rel}",
              f"-the_rel_min={args.the_rel_min}",
-             f"-the_all={args.the_all}"],
+             f"-the_all={args.the_all}",
+             f"-exps={exps_dir}/"],
             cwd=ruleformer_root,
         )
     else:
