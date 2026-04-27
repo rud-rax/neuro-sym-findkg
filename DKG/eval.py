@@ -139,13 +139,17 @@ def evaluate(model: DynamicGraphModel, data_loader, entire_G, static_entity_emb,
             eval_dict['MRR'] = RankingMetric.mean_reciprocal_rank(eval_ranks)
             for k in [1, 3, 10, 100]:
                 eval_dict[f'REC{k}'] = RankingMetric.recall(eval_ranks, k)
+            for k in [1, 3, 10]:
+                eval_dict[f'NDCG{k}'] = RankingMetric.ndcg(eval_ranks, k)
             logger.info(log_msg + f", MRR={eval_dict['MRR']:.6f}, Rec@1={eval_dict['REC1']:.6f}, Rec@3={eval_dict['REC3']:.6f}, "
-                                  f"Rec@10={eval_dict['REC10']:.6f}, Rec@100={eval_dict['REC100']:.6f}")
+                                  f"Rec@10={eval_dict['REC10']:.6f}, Rec@100={eval_dict['REC100']:.6f}, "
+                                  f"NDCG@1={eval_dict['NDCG1']:.6f}, NDCG@3={eval_dict['NDCG3']:.6f}, NDCG@10={eval_dict['NDCG10']:.6f}")
 
             if phase == "Test":
                 log_root_path = get_log_root_path(args.graph, args.log_dir)
                 with open(os.path.join(log_root_path, f"{args.result_file_prefix}{args.graph}_eval_{args.eval}_link_pred_test_result.txt"), 'w') as f:
-                    f.write(f"{args.seed},{eval_dict['REC1']:.6f},{eval_dict['REC3']:.6f},{eval_dict['REC10']:.6f},{eval_dict['MRR']:.6f}\n")
+                    f.write(f"{args.seed},{eval_dict['REC1']:.6f},{eval_dict['REC3']:.6f},{eval_dict['REC10']:.6f},{eval_dict['MRR']:.6f},"
+                            f"{eval_dict['NDCG1']:.6f},{eval_dict['NDCG3']:.6f},{eval_dict['NDCG10']:.6f}\n")
 
         if phase != "Train":
             eval_dict['loss'] = sum([sum(l) for l in eval_loss_dict.values()])
