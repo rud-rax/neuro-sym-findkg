@@ -24,9 +24,6 @@ class NeuroSymbolicMetrics:
     hits_10: float
     hits_10_neural: float
     hits_10_improvement: float
-    ndcg_10: float
-    ndcg_10_neural: float
-    ndcg_10_improvement: float
     constraint_violations: int
     rules_applied: int
     avg_symbolic_score: float
@@ -53,11 +50,6 @@ class NeuroSymbolicMetrics:
           Neuro-Symbolic: {self.hits_10:.4f}
           Neural Only:    {self.hits_10_neural:.4f}
           Improvement:    {self.hits_10_improvement:+.2f}%
-
-        NDCG@10:
-          Neuro-Symbolic: {self.ndcg_10:.4f}
-          Neural Only:    {self.ndcg_10_neural:.4f}
-          Improvement:    {self.ndcg_10_improvement:+.2f}%
 
         Statistics:
           Constraint Violations: {self.constraint_violations}
@@ -123,16 +115,11 @@ class NeuroSymbolicEvaluator:
         hits_10_neural = self._compute_hits(self.neural_ranks, k=10)
         hits_10_ns = self._compute_hits(self.neuro_symbolic_ranks, k=10)
 
-        # Compute NDCG@10
-        ndcg_10_neural = self._compute_ndcg(self.neural_ranks, k=10)
-        ndcg_10_ns     = self._compute_ndcg(self.neuro_symbolic_ranks, k=10)
-
         # Compute improvements
         mrr_improvement = ((mrr_ns - mrr_neural) / mrr_neural * 100) if mrr_neural > 0 else 0
         hits_1_improvement = ((hits_1_ns - hits_1_neural) / max(hits_1_neural, 0.001) * 100)
         hits_3_improvement = ((hits_3_ns - hits_3_neural) / max(hits_3_neural, 0.001) * 100)
         hits_10_improvement = ((hits_10_ns - hits_10_neural) / max(hits_10_neural, 0.001) * 100)
-        ndcg_10_improvement = ((ndcg_10_ns - ndcg_10_neural) / max(ndcg_10_neural, 1e-6)) * 100
 
         return NeuroSymbolicMetrics(
             mrr=mrr_ns,
@@ -147,9 +134,6 @@ class NeuroSymbolicEvaluator:
             hits_10=hits_10_ns,
             hits_10_neural=hits_10_neural,
             hits_10_improvement=hits_10_improvement,
-            ndcg_10=ndcg_10_ns,
-            ndcg_10_neural=ndcg_10_neural,
-            ndcg_10_improvement=ndcg_10_improvement,
             constraint_violations=self.constraint_violations,
             rules_applied=self.rules_applied,
             avg_symbolic_score=np.mean(self.symbolic_scores) if self.symbolic_scores else 0.0
@@ -164,12 +148,6 @@ class NeuroSymbolicEvaluator:
     def _compute_hits(ranks: List[int], k: int = 10) -> float:
         """Compute Hits@K"""
         return sum(1 for r in ranks if r <= k) / len(ranks) if ranks else 0.0
-
-    @staticmethod
-    def _compute_ndcg(ranks: List[int], k: int = 10) -> float:
-        """Compute NDCG@K with binary relevance (single correct answer per query)"""
-        scores = [1.0 / np.log2(r + 1) if r <= k else 0.0 for r in ranks]
-        return np.mean(scores) if ranks else 0.0
 
     def reset(self):
         """Reset all accumulated data"""

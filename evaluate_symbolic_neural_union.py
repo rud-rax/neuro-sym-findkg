@@ -11,8 +11,8 @@ Usage:
         --symbolic_predictions path/to/sym_triplets.tsv \
         --output_dir outputs/union_eval_valid
 
-Symbolic predictions file format (tab-separated, no header, no time column):
-    head_id<TAB>rel_id<TAB>tail_id
+Symbolic predictions file format (tab-separated, no header):
+    head_id<TAB>rel_id<TAB>tail_id<TAB>time
 
 Coverage metrics:
     sym_coverage  = |sym ∩ gold| / |gold|
@@ -70,7 +70,7 @@ def parse_args():
     parser.add_argument("--top_k", type=int, default=10,
                         help="Number of top-k neural candidates per query (default: 10)")
     parser.add_argument("--symbolic_predictions", required=True,
-                        help="TSV file of symbolic predictions (no header, no time): head_id<TAB>rel_id<TAB>tail_id")
+                        help="TSV file of symbolic predictions: head_id<TAB>rel_id<TAB>tail_id<TAB>time")
     parser.add_argument("--output_dir", required=True,
                         help="Directory to save output files")
     parser.add_argument("--gpu", type=int, default=-1,
@@ -190,9 +190,7 @@ def generate_neural_candidates(
     For each unique (s, r, t) query in the target split, score all entities and
     collect the top-k objects as candidate quadruples (s, r, o_hat, t).
 
-    Returns:
-        neu_triplets: set of (head_id, rel_id, tail_id, time) integer tuples
-        neu_ranked: dict mapping (head_id, rel_id, time) -> [tail_id_rank1, ..., tail_id_rankK]
+    Returns a set of (head_id, rel_id, tail_id, time) integer tuples.
 
     Key design choices:
     - Query deduplication (Option 1): multiple gold edges sharing the same (s, r, t)
@@ -205,7 +203,6 @@ def generate_neural_candidates(
     dynamic_entity_emb = init_entity_emb
     dynamic_relation_emb = init_rel_emb
     neu_triplets = set()
-    neu_ranked = {}  # (s, r, t) -> ranked list of top-k tail ids
 
     with torch.no_grad():
         batch_tqdm = tqdm(data_loader, desc="Generating neural candidates")
@@ -224,9 +221,7 @@ def generate_neural_candidates(
 
             if len(eval_eid) > 0:
                 # ── Shared embeddings for this batch ──────────────────────────
-                # Use CPU graph for node-ID lookup — static/dynamic embeddings are CPU tensors
-                # and newer PyTorch rejects GPU indices into CPU tensors.
-                cumul_nids = cumul_G.ndata[dgl.NID].long()  # CPU
+                cumul_nids = cumul_G_dev.ndata[dgl.NID].long()
                 struct_static = static_emb.structural[cumul_nids].to(device)
                 struct_dynamic = dynamic_entity_emb.structural[cumul_nids][:, -1, :].to(device)
                 combined_emb = model.combiner(struct_static, struct_dynamic, cumul_G_dev)
@@ -277,9 +272,7 @@ def generate_neural_candidates(
 
                 # ── Add candidate quadruples using deduplicated queries ────────
                 for (s, r, t), uid in seen_queries.items():
-                    ranked_tails = top_k_ids[uid].tolist()
-                    neu_ranked[(s, r, int(t))] = ranked_tails
-                    for o_hat in ranked_tails:
+                    for o_hat in top_k_ids[uid].tolist():
                         neu_triplets.add((s, r, int(o_hat), int(t)))
 
             # Update embeddings AFTER predictions — no leakage into next batch.
@@ -289,7 +282,7 @@ def generate_neural_candidates(
                 dynamic_entity_emb, dynamic_relation_emb, device,
             )
 
-    return neu_triplets, neu_ranked
+    return neu_triplets
 
 
 # ---------------------------------------------------------------------------
@@ -377,34 +370,6 @@ def compute_coverage(gold, sym, neu):
         "sym_coverage": len(sym_hit_triples) / n,
         "neu_coverage": len(neu_hit_quads) / n,
         "union_coverage": union_hit / n,
-    }
-
-
-def compute_ndcg_metrics(gold, sym, neu_ranked, k=10):
-    """Compute NDCG@K for neural-only and sym-boosted combined rankings.
-
-    Neural NDCG: rank of gold tail within the neural top-K per query.
-    Combined NDCG: if (s,r,o) ∈ sym, force rank=1; otherwise use neural rank.
-    Gold facts whose tail is absent from the neural top-K contribute 0.
-    """
-    neural_scores, combined_scores = [], []
-
-    for s, r, o, t in gold:
-        ranked = neu_ranked.get((s, r, t), [])
-        neural_rank = ranked.index(o) + 1 if o in ranked else k + 1
-        combined_rank = 1 if (s, r, o) in sym else neural_rank
-
-        neural_scores.append(1.0 / np.log2(neural_rank + 1) if neural_rank <= k else 0.0)
-        combined_scores.append(1.0 / np.log2(combined_rank + 1) if combined_rank <= k else 0.0)
-
-    ndcg_neural   = float(np.mean(neural_scores))   if neural_scores   else 0.0
-    ndcg_combined = float(np.mean(combined_scores)) if combined_scores else 0.0
-    improvement   = ((ndcg_combined - ndcg_neural) / max(ndcg_neural, 1e-6)) * 100
-
-    return {
-        "ndcg_neural":      ndcg_neural,
-        "ndcg_combined":    ndcg_combined,
-        "ndcg_improvement": improvement,
     }
 
 
@@ -514,7 +479,7 @@ def main():
     # 5. Generate neural candidates
     # ------------------------------------------------------------------
     print(f"\n[5/6] Generating neural top-{args.top_k} candidates for split='{args.split}'")
-    neu_triplets, neu_ranked = generate_neural_candidates(
+    neu_triplets = generate_neural_candidates(
         model, target_loader, G,
         static_emb, init_entity_emb, init_rel_emb,
         device, args.top_k,
@@ -533,7 +498,6 @@ def main():
     print(f"  Gold quadruples ({args.split}): {len(gold_quads):,}")
 
     metrics = compute_coverage(gold_quads, sym_triplets, neu_triplets)
-    ndcg_metrics = compute_ndcg_metrics(gold_quads, sym_triplets, neu_ranked, k=args.top_k)
 
     print(f"\n{'='*55}")
     print(f"  Split:          {args.split}")
@@ -542,8 +506,6 @@ def main():
     print(f"  Sym coverage:   {metrics['sym_coverage']:.4f}  ({metrics['sym_hit']:,}/{metrics['num_gold']:,})")
     print(f"  Neu coverage:   {metrics['neu_coverage']:.4f}  ({metrics['neu_hit']:,}/{metrics['num_gold']:,})")
     print(f"  Union coverage: {metrics['union_coverage']:.4f}  ({metrics['union_hit']:,}/{metrics['num_gold']:,})")
-    print(f"  NDCG@{args.top_k} neural:   {ndcg_metrics['ndcg_neural']:.4f}")
-    print(f"  NDCG@{args.top_k} combined: {ndcg_metrics['ndcg_combined']:.4f}  ({ndcg_metrics['ndcg_improvement']:+.1f}% vs neural)")
     print(f"{'='*55}\n")
 
     # ------------------------------------------------------------------
@@ -555,7 +517,6 @@ def main():
     # metrics.json
     metrics_out = {
         **metrics,
-        **ndcg_metrics,
         "split": args.split,
         "top_k": args.top_k,
         "checkpoint": os.path.abspath(args.checkpoint),
