@@ -297,14 +297,18 @@ def generate_neural_candidates(
 # ---------------------------------------------------------------------------
 
 def load_symbolic_predictions(path):
-    """Load symbolic predictions from TSV: head_id<TAB>rel_id<TAB>tail_id (no time column).
+    """Load symbolic predictions from TSV.
 
-    Symbolic predictions are time-agnostic (s, r, o) triples — the symbolic model
-    predicts future relationships without committing to a specific timestamp.
-    Coverage against gold is checked by matching (s, r, o) only.
+    Accepts both 3-column (head, rel, tail) and 4-column (head, rel, tail, time) files.
+    Coverage is always matched on (s, r, o) — the time column, if present, is ignored.
     """
-    df = pd.read_table(path, sep="\t", header=None, names=["head", "rel", "tail"])
-    return {(int(r.head), int(r.rel), int(r.tail)) for r in df.itertuples(index=False)}
+    triples = set()
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) >= 3:
+                triples.add((int(parts[0]), int(parts[1]), int(parts[2])))
+    return triples
 
 
 def extract_gold_quads(G, split):
