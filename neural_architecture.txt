@@ -107,7 +107,7 @@
   │   │  ╠═══════════════════════════════════════════════════════════════╣  │
   │   │  ║                                                               ║  │
   │   │  ║  for batch_i, (prior_G, batch_G, cumul_G)                    ║  │
-  │   │  ║         in DataLoader(train_times):                          ║  │
+  │   │  ║         in DataLoader(train_times):                          ║  │. priot R t< 
   │   │  ║  │                                                            ║  │
   │   │  ║  │  1. EmbeddingUpdater.forward(prior_G, batch_G, cumul_G)  ║  │
   │   │  ║  │     → updated dynamic_entity_emb, dynamic_relation_emb   ║  │
