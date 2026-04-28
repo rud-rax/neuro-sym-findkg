@@ -142,16 +142,14 @@ class EmbeddingUpdater(nn.Module):
             self.temporal_relation_rnn.forward(batch_G, dynamic_relation_emb.temporal, static_entity_emb.temporal, device)
 
         # Update the dynamic entity embeddings
-        # batch_G is on device after .to(device) above; use .cpu() for CPU-tensor indexing.
-        batch_nid_cpu = batch_G.ndata[dgl.NID][batch_node_indices].cpu().long()
         updated_structural = dynamic_entity_emb.structural
         if batch_structural_dynamic_entity_emb is not None:
             updated_structural = dynamic_entity_emb.structural.clone()
-            updated_structural[batch_nid_cpu] = batch_structural_dynamic_entity_emb.cpu()
+            updated_structural[batch_G.ndata[dgl.NID][batch_node_indices].long()] = batch_structural_dynamic_entity_emb.cpu()
         updated_temporal = dynamic_entity_emb.temporal
         if batch_temporal_dynamic_entity_emb is not None:
             updated_temporal = dynamic_entity_emb.temporal.clone()
-            updated_temporal[batch_nid_cpu] = batch_temporal_dynamic_entity_emb.cpu()
+            updated_temporal[batch_G.ndata[dgl.NID][batch_node_indices].long()] = batch_temporal_dynamic_entity_emb.cpu()
         updated_dynamic_entity_emb = MultiAspectEmbedding(structural=updated_structural, temporal=updated_temporal)
 
         # Update the dynamic relation embeddings
@@ -221,9 +219,7 @@ class GraphStructuralRNNConv(nn.Module):
             batch_node_indices = batch_G.nodes().long()  # update embeddings of all nodes in batch_G
 
         """Structural RNN input"""
-        # batch_G is already on device (moved by EmbeddingUpdater); use .cpu() for CPU-tensor indexing.
-        batch_G_nid_cpu = batch_G.ndata[dgl.NID].cpu().long()
-        batch_structural_static_entity_emb = static_entity_emb.structural[batch_G_nid_cpu].to(device)
+        batch_structural_static_entity_emb = static_entity_emb.structural[batch_G.ndata[dgl.NID].long()].to(device)
         if isinstance(self.graph_conv, RGCN):
             edge_norm = node_norm_to_edge_norm(batch_G)
             conv_structural_static_emb = self.graph_conv(batch_G, batch_structural_static_entity_emb, batch_G.edata['rel_type'].long(), edge_norm)
@@ -242,11 +238,11 @@ class GraphStructuralRNNConv(nn.Module):
             conv_structural_static_emb[batch_node_indices],
         ]
         if self.add_entity_emb:
-            structural_rnn_input.append(static_entity_emb.structural[batch_G_nid_cpu[batch_node_indices.cpu()]].to(device))
+            structural_rnn_input.append(static_entity_emb.structural[batch_G.ndata[dgl.NID][batch_node_indices].long()].to(device))
         structural_rnn_input = torch.cat(structural_rnn_input, dim=1).unsqueeze(1)
 
         # Update structural dynamics
-        structural_dynamic = dynamic_entity_emb.structural[batch_G_nid_cpu[batch_node_indices.cpu()]]
+        structural_dynamic = dynamic_entity_emb.structural[batch_G.ndata[dgl.NID][batch_node_indices].long()]
         structural_dynamic = structural_dynamic.to(device)
 
         output, hn = self.rnn_structural(structural_rnn_input, structural_dynamic.transpose(0, 1).contiguous())  # transpose to make shape to be (num_layers, batch, hidden_size)
@@ -319,9 +315,7 @@ class GraphTemporalRNNConv(nn.Module):
         EventTimeHelper.get_inter_event_times(rev_batch_G, self.node_latest_event_time[..., 1], update_latest_event_time=True)
 
         """Temporal RNN input"""
-        # batch_G is already on device; use .cpu() for CPU-tensor indexing.
-        batch_G_nid_cpu = batch_G.ndata[dgl.NID].cpu().long()
-        batch_temporal_static_entity_emb = static_entity_emb.temporal[batch_G_nid_cpu].to(device)
+        batch_temporal_static_entity_emb = static_entity_emb.temporal[batch_G.ndata[dgl.NID].long()].to(device)
         edge_norm = (1 / self.time_interval_transform(batch_G_sparse_inter_event_times).clamp(min=1e-10)).clamp(max=10.0)
         
         # Encoding dimension
@@ -342,7 +336,7 @@ class GraphTemporalRNNConv(nn.Module):
             batch_G_conv_temporal_static_emb,
         ], dim=1)[batch_node_indices].unsqueeze(1)
 
-        rev_batch_temporal_static_entity_emb = static_entity_emb.temporal[rev_batch_G.ndata[dgl.NID].cpu().long()].to(device)
+        rev_batch_temporal_static_entity_emb = static_entity_emb.temporal[rev_batch_G.ndata[dgl.NID].long()].to(device)
         rev_edge_norm = (1 / self.time_interval_transform(rev_batch_G_sparse_inter_event_times).clamp(min=1e-10)).clamp(max=10.0)
 
         # Encoding node dimension
@@ -360,7 +354,7 @@ class GraphTemporalRNNConv(nn.Module):
             rev_batch_G_conv_temporal_static_emb,
         ], dim=1)[batch_node_indices].unsqueeze(1)
 
-        temporal_dynamic = dynamic_entity_emb.temporal[batch_G_nid_cpu[batch_node_indices.cpu()]].to(device)
+        temporal_dynamic = dynamic_entity_emb.temporal[batch_G.ndata[dgl.NID][batch_node_indices].long()].to(device)
         temporal_dynamic_batch_G = temporal_dynamic[..., 0]  # dynamics as a recipient
         temporal_dynamic_rev_batch_G = temporal_dynamic[..., 1]  # dynamics as a sender
 
@@ -395,9 +389,8 @@ class RelationRNN(nn.Module):
         batch_G_src, batch_G_dst = batch_G.edges()
         batch_G_rel = batch_G.edata['rel_type'].long()
 
-        # batch_G on device; .cpu() needed to index CPU embedding tensors below.
-        batch_G_src_nid = batch_G.ndata[dgl.NID][batch_G_src.long()].cpu().long()
-        batch_G_dst_nid = batch_G.ndata[dgl.NID][batch_G_dst.long()].cpu().long()
+        batch_G_src_nid = batch_G.ndata[dgl.NID][batch_G_src.long()].long()
+        batch_G_dst_nid = batch_G.ndata[dgl.NID][batch_G_dst.long()].long()
 
         # aggregate entity embeddings by relation. transpose() is necessary to aggregate entity emb matrix row-wise.
         batch_G_src_emb_avg_by_rel_ = \
@@ -436,36 +429,30 @@ class EventTimeHelper:
 
     @classmethod
     def get_sparse_latest_event_times(cls, batch_G, node_latest_event_time, _global=False):
-        device = batch_G.ndata[dgl.NID].device
-        # node_latest_event_time is a CPU tensor; indices must be on CPU.
-        batch_G_nid_cpu = batch_G.ndata[dgl.NID].cpu().long()
-        batch_latest_event_time = node_latest_event_time[batch_G_nid_cpu]
+        batch_G_nid = batch_G.ndata[dgl.NID].long()
+        batch_latest_event_time = node_latest_event_time[batch_G_nid]
 
         batch_G_src, batch_G_dst = batch_G.edges()
-        batch_G_src_cpu, batch_G_dst_cpu = batch_G_src.cpu().long(), batch_G_dst.cpu().long()
+        device = batch_G.ndata[dgl.NID].device
         if _global:
-            return batch_latest_event_time[batch_G_dst_cpu, -1].to(device)
+            return batch_latest_event_time[batch_G_dst.long(), -1].to(device)
         else:
-            return batch_latest_event_time[batch_G_dst_cpu, batch_G_nid_cpu[batch_G_src_cpu]].to(device)
+            return batch_latest_event_time[batch_G_dst.long(), batch_G_nid[batch_G_src.long()]].to(device)
 
     @classmethod
     def get_inter_event_times(cls, batch_G, node_latest_event_time, update_latest_event_time=True):
-        device = batch_G.ndata[dgl.NID].device
-        # CPU copies for indexing CPU tensors; GPU copies for indexing GPU tensors.
-        batch_G_nid_cpu = batch_G.ndata[dgl.NID].cpu().long()
-        batch_G_nid_dev = batch_G_nid_cpu.to(device)
-        batch_latest_event_time = node_latest_event_time[batch_G_nid_cpu]  # CPU[CPU]
+        batch_G_nid = batch_G.ndata[dgl.NID].long()
+        batch_latest_event_time = node_latest_event_time[batch_G_nid]
 
         batch_G_src, batch_G_dst = batch_G.edges()
-        batch_G_src_dev, batch_G_dst_dev = batch_G_src.long(), batch_G_dst.long()  # GPU
-        batch_G_src_cpu, batch_G_dst_cpu = batch_G_src_dev.cpu(), batch_G_dst_dev.cpu()  # CPU
+        batch_G_src, batch_G_dst = batch_G_src.long(), batch_G_dst.long()
         batch_G_time, batch_G_rel = batch_G.edata['time'], batch_G.edata['rel_type'].long()
         batch_G_time = batch_G_time.to(settings.INTER_EVENT_TIME_DTYPE)
 
+        device = batch_G.ndata[dgl.NID].device
         batch_inter_event_times = torch.zeros(batch_G.num_nodes(), batch_G.num_all_nodes + 1, dtype=settings.INTER_EVENT_TIME_DTYPE).to(device)
-        # GPU tensor indexed with GPU indices; CPU tensor indexed with CPU indices.
-        batch_inter_event_times[batch_G_dst_dev, batch_G_nid_dev[batch_G_src_dev]] = \
-            batch_G_time - batch_latest_event_time[batch_G_dst_cpu, batch_G_nid_cpu[batch_G_src_cpu]].to(device)
+        batch_inter_event_times[batch_G_dst, batch_G_nid[batch_G_src]] = \
+            batch_G_time - batch_latest_event_time[batch_G_dst, batch_G_nid[batch_G_src]].to(device)
 
         batch_G.update_all(fn.copy_e('time', 't'), fn.max('t', 'max_event_time'))
         batch_G_max_event_time = batch_G.ndata['max_event_time'].to(settings.INTER_EVENT_TIME_DTYPE)
@@ -475,8 +462,8 @@ class EventTimeHelper:
         batch_inter_event_times[:, -1] = batch_G_max_event_time - batch_max_latest_event_time
 
         if update_latest_event_time:
-            node_latest_event_time[batch_G_nid_cpu[batch_G_dst_cpu], batch_G_nid_cpu[batch_G_src_cpu]] = batch_G_time.cpu()
-            node_latest_event_time[batch_G_nid_cpu, -1] = batch_G_max_event_time.cpu()
+            node_latest_event_time[batch_G_nid[batch_G_dst], batch_G_nid[batch_G_src]] = batch_G_time.cpu()
+            node_latest_event_time[batch_G_nid, -1] = batch_G_max_event_time.cpu()
 
         return batch_inter_event_times
 
@@ -500,13 +487,12 @@ class StaticEmbeddingUpdater(nn.Module):
 
     def forward(self, batch_G, entity_emb, device):
         batch_G = batch_G.to(device)
-        batch_G_nid_cpu = batch_G.ndata[dgl.NID].cpu()
-        node_features = {'node_type': entity_emb[batch_G_nid_cpu].to(device)}
+        node_features = {'node_type': entity_emb[batch_G.ndata[dgl.NID]].to(device)}
         h_dict = self.graph_structural_conv(batch_G, node_features)
 
         # Update entity embeddings
         updated_entity_emb = entity_emb.clone()
-        updated_entity_emb[batch_G_nid_cpu] = h_dict['node_type'].cpu()
+        updated_entity_emb[batch_G.ndata[dgl.NID]] = h_dict['node_type'].cpu()
 
         return updated_entity_emb
 
