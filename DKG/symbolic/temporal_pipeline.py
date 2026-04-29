@@ -118,7 +118,7 @@ def _prepare_group_data(
 
     Returns the dataset dir path.
     """
-    tag = f"{dataset}_g{g_idx:03d}"
+    tag = f"{dataset}_g{g_idx:03d}_t{g_start}-{g_end}"
     dst_dir = os.path.join(rf_root, "DATASET", tag)
     os.makedirs(dst_dir, exist_ok=True)
 
@@ -232,8 +232,8 @@ def process_group(
     """
     python = sys.executable
     pred_timestamp = g_end + 1
-    train_desc = f"g{g_idx:03d}"
-    decode_desc = f"g{g_idx:03d}-rule"
+    train_desc = f"g{g_idx:03d}_t{g_start}-{g_end}"
+    decode_desc = f"g{g_idx:03d}_t{g_start}-{g_end}-rule"
 
     os.makedirs(exps_path, exist_ok=True)
 
