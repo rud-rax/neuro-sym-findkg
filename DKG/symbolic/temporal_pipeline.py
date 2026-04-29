@@ -17,6 +17,7 @@ import tempfile
 from collections import defaultdict
 
 import pandas as pd
+from tqdm.auto import tqdm
 
 from DKG.symbolic.ruleformer_adapter import (
     _load_id2name,
@@ -41,7 +42,8 @@ def load_all_triplets(data_dir: str) -> list:
         if not os.path.exists(path):
             continue
         df = pd.read_table(path, header=None, names=["h", "r", "t", "time", "_"])
-        for row in df.itertuples(index=False):
+        for row in tqdm(df.itertuples(index=False), total=len(df),
+                        desc=f"  Loading {split}", leave=False):
             triplets.append((int(row.h), int(row.r), int(row.t), int(row.time)))
     return triplets
 
@@ -235,28 +237,36 @@ def process_group(
 
     os.makedirs(exps_path, exist_ok=True)
 
+    pbar = tqdm(total=6, desc=f"Group {g_idx} (t={g_start}–{g_end})", position=0)
+
     # Check if already processed
     import glob
     rules_glob = os.path.join(exps_path, f"{decode_desc}-*", "rules.txt")
     if skip_if_exists and glob.glob(rules_glob):
         rules_path = sorted(glob.glob(rules_glob))[-1]
         print(f"  [skip] rules.txt already exists: {rules_path}")
+        pbar.update(4)  # skip steps 1-4
     else:
         # Step 1: write data files
+        pbar.set_description(f"Group {g_idx} | [1/6] Prepare data")
         dst_dir, tag = _prepare_group_data(
             g_idx, g_start, g_end, all_triplets, groups,
             id2ent, id2rel, rf_root, group_size, dataset,
         )
+        pbar.update(1)
 
         # Step 2: preprocess (build ego-subgraphs)
+        pbar.set_description(f"Group {g_idx} | [2/6] Preprocess")
         _run(
             [python, "transformer/dataset.py",
              f"-data={tag}", f"-maxN={maxn}",
              f"-padding={padding}", f"-jump={jump}"],
             cwd=rf_root,
         )
+        pbar.update(1)
 
         # Step 3: train
+        pbar.set_description(f"Group {g_idx} | [3/6] Train")
         _run(
             [python, "translate.py",
              f"-data=DATASET/{tag}",
@@ -267,8 +277,10 @@ def process_group(
              f"-savestep={savestep}", f"-exps={exps_path}/"],
             cwd=rf_root,
         )
+        pbar.update(1)
 
         # Step 4: decode rules
+        pbar.set_description(f"Group {g_idx} | [4/6] Decode rules")
         ckpt = _find_ckpt(exps_path, train_desc, epochs)
         _run(
             [python, "translate.py",
@@ -281,10 +293,12 @@ def process_group(
              f"-the_all={the_all}", f"-exps={exps_path}/"],
             cwd=rf_root,
         )
+        pbar.update(1)
 
         rules_path = _find_rules_file(exps_path, decode_desc)
 
     # Step 5: apply rules to group G's training subgraph
+    pbar.set_description(f"Group {g_idx} | [5/6] Apply rules")
     train_triplets = filter_triplets_by_time(all_triplets, g_start, g_end)
     hr_t, known = load_kg_from_triplets(train_triplets, id2ent, id2rel)
 
@@ -292,14 +306,18 @@ def process_group(
     print(f"  Rules loaded: {len(rules)}")
 
     predicted_names: set = set()
-    for weight, count, head_rel, body_rels in rules:
+    for _weight, _count, head_rel, body_rels in tqdm(
+            rules, desc=f"Group {g_idx} | [5/6] Applying rules", leave=False):
         for triple in _apply_rule(head_rel, body_rels, hr_t, known):
             predicted_names.add(triple)
+    pbar.update(1)
 
     # Step 6: map names → IDs and tag with pred_timestamp
+    pbar.set_description(f"Group {g_idx} | [6/6] Map IDs")
     predictions = []
     skipped = 0
-    for h_name, r_name, t_name in predicted_names:
+    for h_name, r_name, t_name in tqdm(
+            predicted_names, desc=f"Group {g_idx} | [6/6] Mapping IDs", leave=False):
         h_id = ent2id.get(h_name)
         r_id = rel2id.get(r_name)
         t_id = ent2id.get(t_name)
@@ -307,6 +325,8 @@ def process_group(
             skipped += 1
             continue
         predictions.append((h_id, r_id, t_id, pred_timestamp))
+    pbar.update(1)
+    pbar.close()
 
     if skipped:
         print(f"  Skipped {skipped} predictions with unmapped names")
