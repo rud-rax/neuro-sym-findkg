@@ -90,6 +90,33 @@ def adapt_findkg_for_ruleformer(data_dir: str, dataset: str, ruleformer_root: st
     return dst_dir
 
 
+def filter_triplets_by_time(triplets: list, t_start: int, t_end: int) -> list:
+    """Return only triplets whose timestamp falls within [t_start, t_end]."""
+    return [row for row in triplets if t_start <= row[3] <= t_end]
+
+
+def write_ruleformer_split_from_memory(
+    triplets: list, dst_path: str, id2ent: dict, id2rel: dict
+):
+    """Write a Ruleformer-format name-based split file from an in-memory triplet list.
+
+    triplets: list of (h_id, r_id, t_id, time) or (h_id, r_id, t_id, time, _)
+    """
+    lines = []
+    for row in triplets:
+        h_id, r_id, t_id = int(row[0]), int(row[1]), int(row[2])
+        h = id2ent.get(h_id)
+        r = id2rel.get(r_id)
+        t = id2ent.get(t_id)
+        if h is None or r is None or t is None:
+            continue
+        lines.append(f"{h}\t{r}\t{t}")
+    os.makedirs(os.path.dirname(os.path.abspath(dst_path)), exist_ok=True)
+    with open(dst_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"  Wrote {os.path.basename(dst_path)} ({len(lines):,} triples)")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Adapt FinDKG dataset for Ruleformer")
     parser.add_argument("--data_dir", default="FinDKG_dataset")

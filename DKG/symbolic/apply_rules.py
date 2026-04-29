@@ -45,6 +45,26 @@ def load_kg(train_path: str):
     return hr_t, known
 
 
+def load_kg_from_triplets(triplets: list, id2ent: dict, id2rel: dict):
+    """Build hr_t and known from an in-memory list of (h_id, r_id, t_id, time[, _]).
+
+    Mirrors load_kg() but operates on in-memory data instead of a file.
+    Returns:
+        hr_t  — {(head_name, rel_name): set of tail_names}
+        known — set of (head_name, rel_name, tail_name)
+    """
+    hr_t = defaultdict(set)
+    for row in triplets:
+        h_name = id2ent.get(int(row[0]))
+        r_name = id2rel.get(int(row[1]))
+        t_name = id2ent.get(int(row[2]))
+        if h_name is None or r_name is None or t_name is None:
+            continue
+        hr_t[(h_name, r_name)].add(t_name)
+    known = {(h, r, t) for (h, r), tails in hr_t.items() for t in tails}
+    return hr_t, known
+
+
 # ---------------------------------------------------------------------------
 # Rule parsing
 # ---------------------------------------------------------------------------
