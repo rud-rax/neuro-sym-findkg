@@ -135,13 +135,6 @@ python3 run_symbolic.py \
 - on google drive
 - implemented for symbolic reasoning
 
----
-
-# HPC Access
-
-
-ssh -X rnaik@spartan03.sjsu.edu
-ruduboi1234
 
 ---
 
