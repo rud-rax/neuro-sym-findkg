@@ -290,14 +290,9 @@ def generate_neural_candidates(
 # ---------------------------------------------------------------------------
 
 def load_symbolic_predictions(path):
-    """Load symbolic predictions from TSV: head_id<TAB>rel_id<TAB>tail_id (no time column).
-
-    Symbolic predictions are time-agnostic (s, r, o) triples — the symbolic model
-    predicts future relationships without committing to a specific timestamp.
-    Coverage against gold is checked by matching (s, r, o) only.
-    """
-    df = pd.read_table(path, sep="\t", header=None, names=["head", "rel", "tail"])
-    return {(int(r.head), int(r.rel), int(r.tail)) for r in df.itertuples(index=False)}
+    """Load symbolic predictions from 4-column TSV: h_id  r_id  t_id  timestamp."""
+    df = pd.read_table(path, sep="\t", header=None, names=["head", "rel", "tail", "time"])
+    return {(int(h), int(r), int(t), int(ts)) for h, r, t, ts in df.values}
 
 
 def extract_gold_quads(G, split):
@@ -491,13 +486,14 @@ def main():
     # ------------------------------------------------------------------
     print(f"\n[6/6] Computing coverage metrics")
 
-    sym_triplets = load_symbolic_predictions(args.symbolic_predictions)
-    print(f"  Symbolic predictions loaded: {len(sym_triplets):,} quadruples")
+    sym_quads = load_symbolic_predictions(args.symbolic_predictions)
+    sym_triples = {(s, r, o) for s, r, o, _ in sym_quads}
+    print(f"  Symbolic predictions loaded: {len(sym_quads):,} quadruples")
 
     gold_quads = extract_gold_quads(G, args.split)
     print(f"  Gold quadruples ({args.split}): {len(gold_quads):,}")
 
-    metrics = compute_coverage(gold_quads, sym_triplets, neu_triplets)
+    metrics = compute_coverage(gold_quads, sym_triples, neu_triplets)
 
     print(f"\n{'='*55}")
     print(f"  Split:          {args.split}")
@@ -535,10 +531,10 @@ def main():
     save_tsv(quads_to_df(neu_triplets, id2entity, id2relation),
              os.path.join(args.output_dir, "neural_candidates.tsv"))
 
-    save_tsv(quads_to_df(sym_triplets, id2entity, id2relation),
+    save_tsv(quads_to_df(sym_quads, id2entity, id2relation),
              os.path.join(args.output_dir, "symbolic_predictions_used.tsv"))
 
-    save_tsv(quads_to_df(sym_triplets | neu_triplets, id2entity, id2relation),
+    save_tsv(quads_to_df(sym_quads | neu_triplets, id2entity, id2relation),
              os.path.join(args.output_dir, "union_candidates.tsv"))
 
     print(f"\nAll outputs written to: {args.output_dir}")
